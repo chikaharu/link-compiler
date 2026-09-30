@@ -28,8 +28,9 @@ class Compiler:
         self.vars = {}
         self.identity = set()
         self.q2 = {}
-        self.elements = set()
+        self.element_regs = set()
         self.element_adjoints = {}
+        self.element_negations = {}
         self.operator_links = []
 
     def emit(self, op, shape, **fields):
@@ -63,13 +64,15 @@ class Compiler:
         if op == 'element':
             value = _scalar(node[1])
             reg = self.emit('element', (1, 1), value=_complex_json(value))
-            self.elements.add(reg)
+            self.element_regs.add(reg)
             return reg
         if op == 'element_link':
             left, right = self.expr(node[1]), self.expr(node[2])
             if self.types[left] != (1, 1) or self.types[right] != (1, 1):
                 raise LinkError('link(a,b) requires two ElementLinks')
-            return self.emit('element_link', (1, 1), left=left, right=right)
+            reg = self.emit('element_link', (1, 1), left=left, right=right)
+            self.element_regs.add(reg)
+            return reg
         if op == 'phase2':
             theta = _scalar(node[1])
             if complex(theta).imag:
@@ -79,17 +82,28 @@ class Compiler:
             reg = self.emit('phase2', (1, 1), q=q)
             self.q2[reg] = q
             return reg
+        if op == 'neg':
+            source = self.expr(node[1])
+            if source not in self.element_regs:
+                raise LinkError('Unary - on a Link is reserved for ElementLink pole negation')
+            if source in self.element_negations:
+                return self.element_negations[source]
+            reg = self.emit('element_neg', (1, 1), arg=source)
+            self.element_regs.add(reg)
+            self.element_negations[reg] = source
+            return reg
         if op == 'adjoint':
             source = self.expr(node[1])
             m, n = self.types[source]
             if source in self.identity:
                 return source
-            if source in self.elements:
-                reg = self.emit('element_adjoint', (1, 1), arg=source)
-                self.element_adjoints[reg] = source
-                return reg
             if source in self.element_adjoints:
                 return self.element_adjoints[source]
+            if source in self.element_regs:
+                reg = self.emit('element_adjoint', (1, 1), arg=source)
+                self.element_regs.add(reg)
+                self.element_adjoints[reg] = source
+                return reg
             if source in self.q2:
                 q = (-self.q2[source]) % 4
                 reg = self.emit('phase2', (1, 1), q=q)
