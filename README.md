@@ -5,7 +5,8 @@ Rust-like block/type syntax, Perl-style `$` variables and `†` adjoint. **Rows 
 Requires Python >=3.10, no runtime dependencies.
 
 ```bash
-cd linkc
+git clone https://github.com/chikaharu/link-compiler.git
+cd link-compiler
 python -m linkc examples/identity.link -o examples/identity.lbc --dump-lir
 python -m linkc vm examples/identity.lbc
 python -m unittest discover -s tests -v
