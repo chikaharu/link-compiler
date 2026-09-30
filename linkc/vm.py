@@ -45,6 +45,16 @@ def run(program):
         elif op == 'matrix':
             vals = instruction['values']
             a = [[complex(*item) for item in row] for row in vals]
+        elif op == 'element':
+            if (m, n) != (1, 1):
+                raise LinkError('ElementLink must have shape 1x1')
+            a = [[complex(*instruction['value'])]]
+        elif op == 'element_link':
+            if (m, n) != (1, 1):
+                raise LinkError('ElementLink crosstalk must have shape 1x1')
+            left, right = ref('left'), ref('right')
+            ea, eb = left[0][0], right[0][0]
+            a = [[-1j * ea.conjugate() * eb]]
         elif op == 'phase2':
             if (m, n) != (1, 1) or instruction['q'] not in range(4):
                 raise LinkError('Invalid phase2 bytecode')
