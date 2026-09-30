@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linkc-vm"
+version = "0.3.1"
+description = "Typed Link compiler, LinkVM, and native lowering backends"
+requires-python = ">=3.10"
+
+[project.scripts]
+linkc = "linkc.cli:compile_main"
+linkvm = "linkc.cli:vm_main"
+
+[tool.setuptools.packages.find]
+include = ["linkc*"]
