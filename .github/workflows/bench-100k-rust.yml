@@ -1,0 +1,17 @@
+name: Benchmark 100k Rust Link
+on:
+  push:
+    branches: [experiment/100k-four-language-benchmark]
+  workflow_dispatch:
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and benchmark
+        run: |
+          rustc -C opt-level=3 benchmarks/100k/bench.rs -o /tmp/bench-rust
+          /tmp/bench-rust
+          /tmp/bench-rust
+          /tmp/bench-rust
