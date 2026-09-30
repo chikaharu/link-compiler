@@ -7,7 +7,7 @@ fn main(){
  let mut q=vec![0u8;N];let mut mats=vec![[0.;9];N];let mut s=20260930u32;
  for i in 0..N{
  s=s.wrapping_mul(1664525).wrapping_add(1013904223);q[i]=((s>>24)&3)as u8;
- let th=(q[i]as f64+1.)*.00013;let(c,v)=(th.cos(),th.sin());let mut a=[1.,0.,0.,0.,1.,0.,0.,0.,1.];
+ let th=(q[i]as f64+1.)*0.00013;let(c,v)=(th.cos(),th.sin());let mut a=[1.,0.,0.,0.,1.,0.,0.,0.,1.];
  match i%3{0=>{a[4]=c;a[8]=c;a[5]=-v;a[7]=v;},1=>{a[0]=c;a[8]=c;a[2]=v;a[6]=-v;},_=>{a[0]=c;a[4]=c;a[1]=-v;a[3]=v;}}mats[i]=a;
  }
  let expected=q.iter().fold(0usize,|x,&v|(x+v as usize)&3);
@@ -20,11 +20,11 @@ fn main(){
  for m in &mats{total=mul(&total,m);}pre+=t.elapsed().as_secs_f64()*1e3;
  let t=Instant::now();
  for query in 0..Q{
- let mut x:V=[.1+query as f64*.001,.4-query as f64*.0004,.7+query as f64*.0001];let input=x;
+ let mut x:V=[0.1+query as f64*0.001,0.4-query as f64*0.0004,0.7+query as f64*0.0001];let input=x;
  for m in &mats{x=apply(&x,m);}let z=apply(&input,&total);
  for j in 0..3{let d=(x[j]-z[j]).abs();if d>err{err=d;}}
  sink=sink.wrapping_add((x[0].abs()*1e6)as u64);std::hint::black_box(sink);
  }seq+=t.elapsed().as_secs_f64()*1e3;
  }
- println!("lang=Rust phase_us={:.3} pre_ms={:.3} seq10_ms={:.3} result={} error={:.3e} sink={}",phase,pre/R as f64,seq/R as f64,expected,err,sink);assert_eq!(expected,3);
+ println!("lang=Rust phase_us={:0.3} pre_ms={:0.3} seq10_ms={:0.3} result={} error={:0.3e} sink={}",phase,pre/R as f64,seq/R as f64,expected,err,sink);assert_eq!(expected,3);
 }
