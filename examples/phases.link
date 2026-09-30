@@ -1,0 +1,5 @@
+fn main() -> Link<C[1], C[1]> {
+    let $A = phase2(1.6);
+    let $B = phase2(3.15);
+    return $A @ $B;
+}

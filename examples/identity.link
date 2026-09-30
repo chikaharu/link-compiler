@@ -1,0 +1,6 @@
+fn main() -> Link<C[4], C[4]> {
+    let $L: Link<C[4], C[4]> = identity::<C[4]>();
+    let $A = $L†;
+    let $B = $A @ $L;
+    return $B;
+}
