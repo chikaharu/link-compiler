@@ -1,0 +1,21 @@
+name: Local Link block benchmark
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/100k/local_blocks.rs'
+      - '.github/workflows/local-block-benchmark.yml'
+  push:
+    branches: [experiment/100k-four-language-benchmark]
+  workflow_dispatch:
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust local Link block benchmarks
+        run: |
+          rustc -C opt-level=3 benchmarks/100k/local_blocks.rs -o /tmp/local-blocks
+          /tmp/local-blocks
+          /tmp/local-blocks
+          /tmp/local-blocks

@@ -1,0 +1,35 @@
+name: Four-language 100k Link benchmark
+on:
+  push:
+    branches: [experiment/100k-four-language-benchmark]
+  workflow_dispatch:
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build all four languages
+        working-directory: benchmarks/100k
+        run: |
+          gcc --version | head -1
+          g++ --version | head -1
+          rustc --version
+          go version
+          /usr/bin/time -f 'BUILD C %e s' gcc -O3 -std=c11 bench.c -lm -o bench-c
+          /usr/bin/time -f 'BUILD C++ %e s' g++ -O3 -std=c++17 bench.cpp -o bench-cpp
+          /usr/bin/time -f 'BUILD Rust %e s' rustc -C opt-level=3 bench.rs -o bench-rust
+          /usr/bin/time -f 'BUILD Go %e s' go build -o bench-go bench.go
+      - name: Run repeated benchmarks
+        working-directory: benchmarks/100k
+        run: |
+          for round in 1 2 3 4 5; do
+            echo "ROUND=$round"
+            ./bench-c
+            ./bench-cpp
+            ./bench-rust
+            ./bench-go
+          done
