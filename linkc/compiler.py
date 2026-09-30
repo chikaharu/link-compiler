@@ -68,7 +68,8 @@ class Compiler:
             return reg
         if op == 'element_link':
             left, right = self.expr(node[1]), self.expr(node[2])
-            if self.types[left] != (1, 1) or self.types[right] != (1, 1):
+            if (self.types[left] != (1, 1) or self.types[right] != (1, 1)
+                    or left not in self.element_regs or right not in self.element_regs):
                 raise LinkError('link(a,b) requires two ElementLinks')
             reg = self.emit('element_link', (1, 1), left=left, right=right)
             self.element_regs.add(reg)
