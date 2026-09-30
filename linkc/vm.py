@@ -28,6 +28,7 @@ def run(program):
         raise LinkError('Unsupported bytecode matrix orientation')
     verify_links(program)
     regs = {}
+    element_states = {}
     for instruction in program.get('registers', []):
         op, idx, shape = instruction['op'], instruction['dst'], instruction['shape']
         if not isinstance(idx, int) or idx < 0 or idx in regs or idx != len(regs):
@@ -48,17 +49,50 @@ def run(program):
         elif op == 'element':
             if (m, n) != (1, 1):
                 raise LinkError('ElementLink must have shape 1x1')
-            a = [[complex(*instruction['value'])]]
+            value = complex(*instruction['value'])
+            a = [[value]]
+            element_states[idx] = {'value': value, 'pole_sign': 1, 'adjoint': False}
+        elif op == 'element_neg':
+            if (m, n) != (1, 1):
+                raise LinkError('ElementLink negation must have shape 1x1')
+            source_id = instruction['arg']
+            a = [[ref('arg')[0][0]]]
+            if source_id not in element_states:
+                raise LinkError('ElementLink negation requires an ElementLink operand')
+            state = dict(element_states[source_id])
+            state['pole_sign'] *= -1
+            element_states[idx] = state
         elif op == 'element_adjoint':
             if (m, n) != (1, 1):
                 raise LinkError('ElementLink adjoint must have shape 1x1')
+            source_id = instruction['arg']
             a = [[ref('arg')[0][0]]]
+            if source_id not in element_states:
+                raise LinkError('ElementLink adjoint requires an ElementLink operand')
+            state = dict(element_states[source_id])
+            state['adjoint'] = not state['adjoint']
+            element_states[idx] = state
         elif op == 'element_link':
             if (m, n) != (1, 1):
                 raise LinkError('ElementLink crosstalk must have shape 1x1')
-            left, right = ref('left'), ref('right')
-            ea, eb = left[0][0], right[0][0]
-            a = [[-1j * ea.conjugate() * eb]]
+            left_id, right_id = instruction['left'], instruction['right']
+            ref('left')
+            ref('right')
+            if left_id not in element_states or right_id not in element_states:
+                raise LinkError('ElementLink crosstalk requires ElementLink operands')
+
+            def ports(state):
+                value = state['value']
+                sign = state['pole_sign']
+                if state['adjoint']:
+                    return 1j * value, sign * value
+                return sign * value, 1j * value
+
+            _, left_out = ports(element_states[left_id])
+            right_in, _ = ports(element_states[right_id])
+            value = left_out.conjugate() * right_in
+            a = [[value]]
+            element_states[idx] = {'value': value, 'pole_sign': 1, 'adjoint': False}
         elif op == 'phase2':
             if (m, n) != (1, 1) or instruction['q'] not in range(4):
                 raise LinkError('Invalid phase2 bytecode')
@@ -87,4 +121,11 @@ def run(program):
         raise LinkError('Invalid bytecode result register')
     answer = regs[result_id]
     _check_shape(answer, program['result_shape'])
-    return {'shape': program['result_shape'], 'matrix': _matrix_to_json(answer)}
+    result = {'shape': program['result_shape'], 'matrix': _matrix_to_json(answer)}
+    if result_id in element_states:
+        state = element_states[result_id]
+        result['element_state'] = {
+            'pole_sign': state['pole_sign'],
+            'adjoint': state['adjoint'],
+        }
+    return result
