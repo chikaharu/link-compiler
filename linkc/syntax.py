@@ -106,11 +106,18 @@ class Parser:
             args = self.array() if t.value == 'matrix' else None
             self.expect(')')
             left = (t.value, a, b, args)
-        elif t.value == 'phase2':
+        elif t.value in ('phase2', 'element'):
             self.expect('(')
             arg = self.expression()
             self.expect(')')
-            left = ('phase2', arg)
+            left = (t.value, arg)
+        elif t.value == 'link':
+            self.expect('(')
+            source = self.expression()
+            self.expect(',')
+            target = self.expression()
+            self.expect(')')
+            left = ('element_link', source, target)
         else:
             raise LinkError(f'Unexpected expression token {t.value!r} at {t.line}:{t.col}')
         while True:
