@@ -1,0 +1,43 @@
+"""Dependency-free LinkVM (register bytecode interpreter)."""
+from .syntax import LinkError
+from .bridge import verify_links
+def _check_shape(a,shape):
+    m,n=shape
+    if not isinstance(m,int) or not isinstance(n,int) or m<=0 or n<=0: raise LinkError(f'Invalid positive matrix shape {shape!r}')
+    if len(a)!=m or any(len(row)!=n for row in a): raise LinkError(f'Runtime shape mismatch: expected {m}x{n}')
+def multiply(a,b): return [[sum(a[i][k]*b[k][j] for k in range(len(b))) for j in range(len(b[0]))] for i in range(len(a))]
+def _matrix_to_json(a): return [[{'re':z.real,'im':z.imag} for z in row] for row in a]
+def run(program):
+    if program.get('format')!='link-bytecode' or program.get('version')!=1: raise LinkError('Unsupported bytecode format or version')
+    if program.get('orientation')!='input-rows-output-columns': raise LinkError('Unsupported bytecode matrix orientation')
+    verify_links(program); regs={}
+    for ins in program.get('registers',[]):
+        op,idx,shape=ins['op'],ins['dst'],ins['shape']
+        if not isinstance(idx,int) or idx<0 or idx in regs or idx!=len(regs): raise LinkError('Bytecode register IDs must be sequential and unique')
+        def ref(field):
+            key=ins[field]
+            if not isinstance(key,int) or key not in regs: raise LinkError(f'Register %{idx} uses missing/future reference %{key}')
+            return regs[key]
+        m,n=shape
+        if op=='identity':
+            if m!=n:raise LinkError('Identity must be square')
+            a=[[complex(i==j) for j in range(n)] for i in range(m)]
+        elif op=='matrix': a=[[complex(*item) for item in row] for row in ins['values']]
+        elif op=='phase2':
+            if (m,n)!=(1,1) or ins['q'] not in range(4):raise LinkError('Invalid phase2 bytecode')
+            a=[[(1,1j,-1,-1j)[ins['q']]]]
+        elif op=='adjoint':
+            x=ref('arg'); a=[[x[j][i].conjugate() for j in range(len(x))] for i in range(len(x[0]))]
+        elif op=='compose':
+            left,right=ref('left'),ref('right')
+            if len(right[0])!=len(left):raise LinkError('Bytecode composition dimension mismatch')
+            a=multiply(right,left)
+        elif op in ('add','sub'):
+            left,right=ref('left'),ref('right')
+            if len(left)!=len(right) or len(left[0])!=len(right[0]):raise LinkError('Bytecode addition/subtraction dimension mismatch')
+            sign=1 if op=='add' else -1; a=[[left[i][j]+sign*right[i][j] for j in range(len(left[0]))] for i in range(len(left))]
+        else:raise LinkError(f'Unknown bytecode opcode {op!r}')
+        _check_shape(a,shape); regs[idx]=a
+    result=program.get('result')
+    if not isinstance(result,int) or result not in regs:raise LinkError('Invalid bytecode result register')
+    answer=regs[result]; _check_shape(answer,program['result_shape']); return {'shape':program['result_shape'],'matrix':_matrix_to_json(answer)}
