@@ -28,6 +28,8 @@ class Compiler:
         self.vars = {}
         self.identity = set()
         self.q2 = {}
+        self.elements = set()
+        self.element_adjoints = {}
         self.operator_links = []
 
     def emit(self, op, shape, **fields):
@@ -60,7 +62,9 @@ class Compiler:
             return self.emit('matrix', (rows, cols), values=vals)
         if op == 'element':
             value = _scalar(node[1])
-            return self.emit('element', (1, 1), value=_complex_json(value))
+            reg = self.emit('element', (1, 1), value=_complex_json(value))
+            self.elements.add(reg)
+            return reg
         if op == 'element_link':
             left, right = self.expr(node[1]), self.expr(node[2])
             if self.types[left] != (1, 1) or self.types[right] != (1, 1):
@@ -80,6 +84,12 @@ class Compiler:
             m, n = self.types[source]
             if source in self.identity:
                 return source
+            if source in self.elements:
+                reg = self.emit('element_adjoint', (1, 1), arg=source)
+                self.element_adjoints[reg] = source
+                return reg
+            if source in self.element_adjoints:
+                return self.element_adjoints[source]
             if source in self.q2:
                 q = (-self.q2[source]) % 4
                 reg = self.emit('phase2', (1, 1), q=q)
