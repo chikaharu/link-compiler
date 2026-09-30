@@ -18,7 +18,7 @@ def _scalar(node):
     if op in ('add', 'sub'):
         x, y = _scalar(node[1]), _scalar(node[2])
         return x + y if op == 'add' else x - y
-    raise LinkError('Matrix entries and phase2 angles must be compile-time scalar constants')
+    raise LinkError('Matrix entries, phase2 angles, and element values must be compile-time scalar constants')
 
 
 class Compiler:
@@ -58,6 +58,14 @@ class Compiler:
                 raise LinkError(f'Matrix literal requires {rows} input rows and {cols} output columns')
             vals = [[_complex_json(_scalar(value)) for value in row] for row in raw]
             return self.emit('matrix', (rows, cols), values=vals)
+        if op == 'element':
+            value = _scalar(node[1])
+            return self.emit('element', (1, 1), value=_complex_json(value))
+        if op == 'element_link':
+            left, right = self.expr(node[1]), self.expr(node[2])
+            if self.types[left] != (1, 1) or self.types[right] != (1, 1):
+                raise LinkError('link(a,b) requires two ElementLinks')
+            return self.emit('element_link', (1, 1), left=left, right=right)
         if op == 'phase2':
             theta = _scalar(node[1])
             if complex(theta).imag:
