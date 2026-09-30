@@ -43,15 +43,15 @@ class OperatorLink:
                             tuple((s, other.apply(t)) for s, t in self.edges))
 
 SOURCE = OperatorSpace('LinkSourceOp', ('identity::<T>', 'matrix::<I,O>', 'phase2',
-                                       'element', 'link', '†', '@', '+', '-'))
+                                       'element', 'link', 'element†', '†', '@', '+', '-'))
 SEMANTIC = OperatorSpace('TypedOperation', ('identity', 'matrix', 'phase2',
-                                            'element', 'element_link', 'adjoint', 'compose', 'add', 'sub'))
+                                            'element', 'element_link', 'element_adjoint', 'adjoint', 'compose', 'add', 'sub'))
 BYTECODE = OperatorSpace('LinkVMOpcode', ('identity', 'matrix', 'phase2',
-                                         'element', 'element_link', 'adjoint', 'compose', 'add', 'sub'))
+                                         'element', 'element_link', 'element_adjoint', 'adjoint', 'compose', 'add', 'sub'))
 SOURCE_TO_SEMANTIC = OperatorLink(SOURCE, SEMANTIC, (
     ('identity::<T>', 'identity'), ('matrix::<I,O>', 'matrix'),
     ('phase2', 'phase2'), ('element', 'element'), ('link', 'element_link'),
-    ('†', 'adjoint'), ('@', 'compose'),
+    ('element†', 'element_adjoint'), ('†', 'adjoint'), ('@', 'compose'),
     ('+', 'add'), ('-', 'sub')))
 SEMANTIC_TO_BYTECODE = OperatorLink(SEMANTIC, BYTECODE,
                                     tuple((op, op) for op in SEMANTIC.basis))
@@ -59,7 +59,7 @@ SOURCE_TO_BYTECODE = SOURCE_TO_SEMANTIC.then(SEMANTIC_TO_BYTECODE)
 
 SOURCE_OF = {'identity': 'identity::<T>', 'matrix': 'matrix::<I,O>',
              'phase2': 'phase2', 'element': 'element', 'element_link': 'link',
-             'adjoint': '†', 'compose': '@',
+             'element_adjoint': 'element†', 'adjoint': '†', 'compose': '@',
              'add': '+', 'sub': '-'}
 
 
