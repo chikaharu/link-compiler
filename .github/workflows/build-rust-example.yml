@@ -1,5 +1,5 @@
 name: Build Rust Link native example
-on: [workflow_dispatch, push]
+on: [workflow_dispatch, push, pull_request]
 jobs:
   build:
     strategy:
