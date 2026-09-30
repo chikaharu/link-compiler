@@ -21,6 +21,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Run Link compiler and backend tests
+        run: python -m unittest discover -s tests -v
       - name: Create native binary from Link source
         run: python -m linkc examples/rectangular.link -o examples/rectangular.lbc --rust-bin examples/link-native${{ matrix.suffix }}
       - name: Run generated binary
@@ -28,4 +30,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: link-native-${{ matrix.target }}
-          path: examples/link-native-${{ matrix.suffix }}
+          path: examples/link-native${{ matrix.suffix }}
