@@ -1,5 +1,9 @@
 name: Benchmark 100k Rust Link
 on:
+  pull_request:
+    paths:
+      - 'benchmarks/100k/**'
+      - '.github/workflows/bench-100k-rust.yml'
   push:
     branches: [experiment/100k-four-language-benchmark]
   workflow_dispatch:
