@@ -1,0 +1,31 @@
+name: Build Rust Link native example
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            suffix: ''
+          - os: macos-latest
+            target: macos
+            suffix: ''
+          - os: windows-latest
+            target: windows
+            suffix: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create native binary from Link source
+        run: python -m linkc examples/rectangular.link -o examples/rectangular.lbc --rust-bin examples/link-native${{ matrix.suffix }}
+      - name: Run generated binary
+        run: python -c "import subprocess,json; a=json.loads(subprocess.check_output(['examples/link-native${{ matrix.suffix }}'])); assert a['shape']==[3,2]; assert a['matrix'][2][0]['re']==2.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: link-native-${{ matrix.target }}
+          path: examples/link-native-${{ matrix.suffix }}
