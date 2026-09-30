@@ -49,6 +49,10 @@ def run(program):
             if (m, n) != (1, 1):
                 raise LinkError('ElementLink must have shape 1x1')
             a = [[complex(*instruction['value'])]]
+        elif op == 'element_adjoint':
+            if (m, n) != (1, 1):
+                raise LinkError('ElementLink adjoint must have shape 1x1')
+            a = [[ref('arg')[0][0]]]
         elif op == 'element_link':
             if (m, n) != (1, 1):
                 raise LinkError('ElementLink crosstalk must have shape 1x1')
