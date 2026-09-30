@@ -14,7 +14,6 @@ Experimental typed Link compiler with Rust-like block/type syntax, Perl-style `$
   -> backend Link
        -> Python LinkVM
        -> standalone Rust source / rustc native binary
-       -> standalone C / GCC native fallback
 ```
 
 The operator Links are sparse incidence maps between representation spaces. They do not assert that arbitrary programs are linear operators.
@@ -51,10 +50,9 @@ The generated Rust has no external crate dependency.
 - identity / exact 2-bit phase simplification and dead-register elimination
 - Python LinkVM
 - Rust source/native backend
-- C/GCC native fallback backend
 
 ## Status
 
-This is an experimental compiler prototype, not yet a general implementation of crosstalk, carry, residual projection, or arbitrary interval compression. Rust source generation is tested; the development environment used for v0.3.1 did not contain `rustc`, so genuine Rust-native execution still needs CI/host verification. The C/GCC native fallback was executed and matched LinkVM numerically.
+This is an experimental compiler prototype, not yet a general implementation of crosstalk, carry, residual projection, or arbitrary interval compression. Rust source generation is tested; the development environment used for v0.3.1 did not contain `rustc`, so genuine Rust-native execution still needs CI/host verification. The optional C/GCC fallback remains in the local prototype and is not included in this pull request.
 
 See `docs/` for the mathematical and compiler architecture.
