@@ -120,6 +120,16 @@ def seam_cancel(nodes, result):
             elif nd['kind'] == 'aff' and l['kind'] == 'aff':
                 if nd['p'] * l['p'] == 1.0 and nd['p'] * l['q'] + nd['q'] == 0.0:
                     repl = l['x']
+            elif nd['kind'] == 'div' and l['kind'] == 'aff' and l['q'] == 0.0:
+                # (x * C) / C with the *same constant value* C: the seam joins.
+                sn = nodes[nd['s']] if isinstance(nd['s'], int) else None
+                if sn is not None and sn['kind'] == 'const' and sn['p'] == l['p']:
+                    repl = l['x']
+            elif nd['kind'] == 'aff' and nd['q'] == 0.0 and l['kind'] == 'div':
+                # (x / C) * C with the same constant value C.
+                sn = nodes[l['s']] if isinstance(l['s'], int) else None
+                if sn is not None and sn['kind'] == 'const' and sn['p'] == nd['p']:
+                    repl = l['x']
             elif (l['kind'], nd['kind']) in (('add', 'sub'), ('sub', 'add'),
                                              ('mul', 'div'), ('div', 'mul')):
                 if l['s'] is not None and l['s'] == nd['s']:
@@ -203,7 +213,15 @@ class Builder:
             if kind == 'sub' and self.is_const(x): return self.mk_aff(s, -1.0, self.const_val[x])
             if kind == 'mul' and self.is_const(s): return self.mk_aff(x, self.const_val[s], 0.0)
             if kind == 'mul' and self.is_const(x): return self.mk_aff(s, self.const_val[x], 0.0)
-            if kind == 'div' and self.is_const(s): return self.mk_aff(x, 1.0 / self.const_val[s], 0.0)
+            if kind == 'div' and self.is_const(s):
+                c = self.const_val[s]
+                # x / c as x * (1/c) is exact only when c is a power of two.
+                # Otherwise keep a true division node: the reciprocal's
+                # rounding would change the value even when no seam cancels.
+                # seam_cancel can still cancel this div against a matching
+                # multiplication by the same constant.
+                if c != 0.0 and math.frexp(c)[0] == 0.5:
+                    return self.mk_aff(x, 1.0 / c, 0.0)
         return self.add(kind, x=x, s=s)
 
     def lower(self, e):
@@ -471,11 +489,18 @@ def main():
                     help='route the --tokens stream through its boundary representation first')
     ap.add_argument('--trace', metavar='NAME',
                     help='record every value assigned to NAME, then boundary-analyse the trajectory')
+    ap.add_argument('--emit-ast', metavar='PATH',
+                    help='write the reduced program back as a .link AST (consumable by linkc)')
     a = ap.parse_args()
 
     with open(a.source) as f:
         stmts = parse(f.read())
     reduced = Lower(mode=a.mode).program(stmts)
+    if a.emit_ast:
+        from linkemit import emit_program, to_source
+        with open(a.emit_ast, 'w') as f:
+            f.write(to_source(emit_program(reduced, stmts)))
+        print(f'[linkir] reduced AST written to {a.emit_ast}')
     raw = Lower(mode='none').program(stmts)
     n_red, n_raw = count_nodes(reduced), count_nodes(raw)
     if not a.no_dump:

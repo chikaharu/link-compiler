@@ -270,7 +270,9 @@ class Codegen:
             t = self.infer(args[0])
             if t == VEC:
                 return f'vmap({self.ref(args[0])}, f64::{f})'
-            return f'{self.expr(args[0])}.{f}()'
+            # f64::f(x), not x.f(): a literal receiver (16.0.sqrt()) is an
+            # ambiguous float type to rustc (E0689).
+            return f'f64::{f}({self.expr(args[0])})'
         if op in ('<', '<=', '>', '>=', '==', '!='):
             rust = {'==': '==', '!=': '!='}.get(op, op)
             return f'({self.expr(args[0])} {rust} {self.expr(args[1])})'
@@ -392,10 +394,27 @@ def main():
     ap.add_argument('--emit-rs', help='where to write generated Rust (default: <out>.rs)')
     ap.add_argument('--run', action='store_true')
     ap.add_argument('--opt', default='3', help='rustc opt-level (default 3)')
+    ap.add_argument('--boundary', action='store_true',
+                    help='run linkir boundary reduction (seam cancellation) before codegen; '
+                         'scalar programs only, others compile as-is')
     a = ap.parse_args()
 
     with open(a.source) as f:
         stmts = parse(f.read())
+    if a.boundary:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from linkir import Lower, count_nodes
+            from linkemit import emit_program
+            lowered = Lower(mode='boundary').program(stmts)
+            raw = Lower(mode='none').program(stmts)
+        except Exception as e:
+            print(f'[linkc] boundary reduction not applicable ({e}); compiling as-is',
+                  file=sys.stderr)
+        else:
+            print(f'[linkc] boundary reduction: {count_nodes(raw)} -> '
+                  f'{count_nodes(lowered)} 1x1 Links')
+            stmts = emit_program(lowered, stmts)
     rs = Codegen().compile(stmts)
     rs_path = a.emit_rs or (a.out + '.rs')
     os.makedirs(os.path.dirname(os.path.abspath(rs_path)), exist_ok=True)

@@ -191,8 +191,49 @@ python3 linkir.py prog.link --run --trace s                       # 変数の軌
 なおグラフ側の縮約（継ぎ目打ち消し、--mode boundary）は担当側の解釈として残置し、
 私案の境界定義はこのストリーム表現が正本。
 
+## v0.6 境界縮約をコンパイラ本体に組み込む（linkemit.py、2026-10-25）
+
+これまで境界縮約は linkir のインタプリタの中で完結していて、生成バイナリには
+流れていなかった。IR → AST の逆方向エミッタ `linkemit.py` を追加し、
+縮約がネイティブバイナリまで届くようにした。
+
+```
+.link --linkir (boundary)--> 縮約済みIR --linkemit--> .link --linkc--> ネイティブバイナリ
+```
+
+```sh
+python3 linkc.py examples/adversarial.link -o out/adv --boundary --run
+# [linkc] boundary reduction: 20 -> 8 1x1 Links
+# a = 1        （書いたままでは 0）
+# b = 1e+200   （書いたままでは inf）
+# c = 1
+python3 linkir.py examples/affine.link --mode boundary --emit-ast out/affine_reduced.link
+```
+
+エミッタの安全規則：`(read-int)` / `(read-eof?)` を含む式は縮約せず元の式を出す
+（IRは両分岐を評価するがASTはしないため、read の複製・脱落は入力ストリームを変える）。
+純粋な共有ノードは木として複製可（膨張上限を超えたら元の式にフォールバック）。
+Vec/Mat 演算を使うプログラムは lowering できないので、`--boundary` はそのまま
+コンパイルする（フォールバックを明示）。
+
+組み込みに伴う修正（fuzz が検出）：
+- **定数除算の逆数化を制限**：`x / c` を `x * (1/c)` にするのは c が2の冪のときだけ
+  にした。それ以外は本物の除算ノードとして残し、同じ定数による乗算との継ぎ目
+  打ち消しルールを seam_cancel に追加。逆数化は継ぎ目がない場合でも丸めを変えて
+  しまう（`x / 7` が plain より1 ulp 悪化するケースを検出）。
+- **linkc の sqrt 等のコード生成**：リテラル受けの `16.0.sqrt()` は rustc が
+  型曖昧で拒否する（E0689）ため `f64::sqrt(x)` 形式に変更（従来からあった不具合で、
+  affine.link を linkc で直接コンパイルすると踏む）。
+
+検証（2026-10-25、このVMで実測）：ランダム式120件（敵対的定数と継ぎ目パターンの
+注入を含む）で plain / boundary / 有理数厳密値を比較し、
+**boundary が plain より厳密値から遠いケース 0件**（一致113件、より近い7件）。
+affine.link は plain と出力完全一致、stats.link（stdin）も一致、
+demo.link / bench.link はフォールバックで正常動作。
+
 ## 次の段階の候補
 
 1. SVD/eigh をLink演算として追加し、PCA持ち上げ実験を `.link` で書き直す
 2. コンパイラ本体をRustに移植して自己ホストする（Python完全脱却）
 3. 型付き中間表現をファイルとして出し、AST→IR→Rust の段を検証可能にする
+   （v0.6 で IR→AST の逆向きは実装済み。linkbin への境界縮約の伝播は未着手）
