@@ -512,10 +512,34 @@ def main():
     ap.add_argument('-o', '--out', required=True)
     ap.add_argument('--run', action='store_true')
     ap.add_argument('--hex', action='store_true', help='print the full byte sequence')
+    ap.add_argument('--boundary', action='store_true',
+                    help='run linkir boundary reduction (integer mode) before codegen; '
+                         'programs it cannot prove equivalent compile as-is')
     a = ap.parse_args()
 
     with open(a.source) as f:
         stmts = parse(f.read())
+    if a.boundary:
+        try:
+            from linkir import Lower, count_nodes
+            from linkemit import emit_program, intify_program, check_int_literals
+            import linkc as _linkc
+            check_int_literals(stmts)
+            lowered = Lower(mode='boundary', integer=True).program(stmts)
+            raw = Lower(mode='none', integer=True).program(stmts)
+            def localize(n):
+                if isinstance(n, _linkc.Str):
+                    return Str(str(n))
+                if isinstance(n, list):
+                    return [localize(x) for x in n]
+                return n
+            stmts = [localize(s) for s in intify_program(emit_program(lowered, stmts))]
+        except Exception as e:
+            print(f'[linkbin] boundary reduction not applicable ({e}); compiling as-is',
+                  file=sys.stderr)
+        else:
+            print(f'[linkbin] boundary reduction: {count_nodes(raw)} -> '
+                  f'{count_nodes(lowered)} 1x1 Links')
     blob = Gen().compile(stmts)
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)

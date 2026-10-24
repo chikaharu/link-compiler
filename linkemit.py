@@ -126,6 +126,40 @@ def emit_program(lowered_stmts, original_stmts):
     return [emit_stmt(l, o) for l, o in zip(lowered_stmts, original_stmts)]
 
 
+# ------------------------------------------------- integer dialect (linkbin)
+
+def check_int_literals(stmts):
+    """Guard for the integer pipeline: every numeric literal in the
+    original program must be an int below 2**53, so that its float
+    image in the IR is still exact."""
+    def walk(n):
+        if isinstance(n, float):
+            raise EmitError('float literal in integer program')
+        if isinstance(n, int) and abs(n) >= 2 ** 53:
+            raise EmitError('integer literal too large for exact float image')
+        if isinstance(n, list):
+            for x in n:
+                walk(x)
+    for s in stmts:
+        walk(s)
+
+
+def intify(node):
+    """Convert an emitted AST back to the integer dialect: integral
+    floats become ints; anything else is rejected (caller falls back)."""
+    if isinstance(node, float):
+        if node.is_integer() and abs(node) < 2 ** 53:
+            return int(node)
+        raise EmitError('non-integral value in emitted integer program')
+    if isinstance(node, list):
+        return [intify(x) for x in node]
+    return node
+
+
+def intify_program(stmts):
+    return [intify(s) for s in stmts]
+
+
 # ------------------------------------------------------------ serialization
 
 def fmt(node):

@@ -80,7 +80,7 @@ def gc_nodes(nodes, result):
         out.append(nd)
     return out, remap[result]
 
-def seam_cancel(nodes, result):
+def seam_cancel(nodes, result, integer=False):
     """Boundary reduction: cancel exactly-inverse pairs at their seam.
 
     No interval is ever composed. Two adjacent links are erased only when
@@ -89,10 +89,15 @@ def seam_cancel(nodes, result):
       aff(p2,q2) after aff(p1,q1) with p2*p1 == 1 and p2*q1 + q2 == 0 (exactly)
       add/sub (or sub/add) fed by the *same* crosstalk node
       mul/div (or div/mul) fed by the *same* crosstalk node
+      (x * C) / C or (x / C) * C for the same constant value C
       exp/log in either order
       identity aff (p=1, q=0) is a seam with nothing: it vanishes
     Cancellation is exact in real arithmetic; in floating point it restores
     the exact-arithmetic value where stepwise evaluation would lose it.
+
+    integer=True (for linkbin's integer dialect) disables every rule whose
+    exactness relies on real division: (x / C) * C is NOT x in integer
+    division, so div-then-multiply pairs never cancel there.
     """
     nodes = [dict(nd) for nd in nodes]
     def rewire(old, new):
@@ -125,13 +130,18 @@ def seam_cancel(nodes, result):
                 sn = nodes[nd['s']] if isinstance(nd['s'], int) else None
                 if sn is not None and sn['kind'] == 'const' and sn['p'] == l['p']:
                     repl = l['x']
-            elif nd['kind'] == 'aff' and nd['q'] == 0.0 and l['kind'] == 'div':
+            elif nd['kind'] == 'aff' and nd['q'] == 0.0 and l['kind'] == 'div' and not integer:
                 # (x / C) * C with the same constant value C.
+                # Real arithmetic only: forbidden in integer mode, where
+                # (x / C) * C != x in general.
                 sn = nodes[l['s']] if isinstance(l['s'], int) else None
                 if sn is not None and sn['kind'] == 'const' and sn['p'] == nd['p']:
                     repl = l['x']
-            elif (l['kind'], nd['kind']) in (('add', 'sub'), ('sub', 'add'),
-                                             ('mul', 'div'), ('div', 'mul')):
+            elif ((l['kind'], nd['kind']) in (('add', 'sub'), ('sub', 'add'),
+                                               ('mul', 'div'))
+                  or ((l['kind'], nd['kind']) == ('div', 'mul') and not integer)):
+                # ('div','mul') is real-arithmetic only, like the constant
+                # case: integer division is not invertible.
                 if l['s'] is not None and l['s'] == nd['s']:
                     repl = l['x']
             elif l['kind'] == 'fn' and nd['kind'] == 'fn':
@@ -151,12 +161,18 @@ class Builder:
                         inverse pairs are cancelled afterwards at their seams
           'interval' -- additionally, affine chains are composed (interval reduction)
     """
-    def __init__(self, mode='interval'):
+    def __init__(self, mode='interval', integer=False):
         self.nodes = []          # dicts: kind, x, s, p, q, name
         self.const_val = {}      # node id -> float, when known constant
         self.norm = {}           # node id -> (base_id, p, q): value = p*base + q
         self.mode = mode
         self.reduce = (mode != 'none')
+        # integer=True: target is linkbin's integer dialect. Constant
+        # folding is disabled (floats cannot fold i64 arithmetic exactly),
+        # divisions stay true division nodes, and seam_cancel is told to
+        # skip rules that need real division. Literal values themselves
+        # stay exact: callers guarantee |literal| < 2**53.
+        self.integer = integer
 
     def add(self, kind, x=None, s=None, p=None, q=None, name=None):
         nid = len(self.nodes)
@@ -174,7 +190,7 @@ class Builder:
 
     def mk_aff(self, x, p, q):
         """y = p*x + q, with affine-chain composition when reducing."""
-        if self.reduce and self.is_const(x):
+        if self.reduce and not self.integer and self.is_const(x):
             return self.const(p * self.const_val[x] + q)
         if self.mode != 'interval':
             return self.add('aff', x=x, p=p, q=q)
@@ -187,7 +203,7 @@ class Builder:
         return nid
 
     def mk_fn(self, name, x):
-        if self.reduce and self.is_const(x):
+        if self.reduce and not self.integer and self.is_const(x):
             try:
                 return self.const(FN1[name](self.const_val[x]))
             except (ValueError, OverflowError):
@@ -196,7 +212,7 @@ class Builder:
 
     def mk_bin(self, kind, x, s):
         """Binary link with through x and crosstalk s, after normalisation."""
-        if self.reduce and self.is_const(x) and self.is_const(s):
+        if self.reduce and not self.integer and self.is_const(x) and self.is_const(s):
             a, b = self.const_val[x], self.const_val[s]
             try:
                 v = {'add': a + b, 'sub': a - b, 'rsub': b - a, 'mul': a * b,
@@ -220,7 +236,7 @@ class Builder:
                 # rounding would change the value even when no seam cancels.
                 # seam_cancel can still cancel this div against a matching
                 # multiplication by the same constant.
-                if c != 0.0 and math.frexp(c)[0] == 0.5:
+                if c != 0.0 and not self.integer and math.frexp(c)[0] == 0.5:
                     return self.mk_aff(x, 1.0 / c, 0.0)
         return self.add(kind, x=x, s=s)
 
@@ -264,17 +280,18 @@ class Builder:
     def finish(self, result):
         """Boundary pass if requested, then drop dead links and renumber."""
         if self.mode == 'boundary':
-            return seam_cancel(self.nodes, result)
+            return seam_cancel(self.nodes, result, integer=self.integer)
         return gc_nodes(self.nodes, result)
 
 # ------------------------------------------------------------- statements
 
 class Lower:
-    def __init__(self, mode='interval'):
+    def __init__(self, mode='interval', integer=False):
         self.mode = mode
+        self.integer = integer
 
     def expr(self, e):
-        b = Builder(mode=self.mode)
+        b = Builder(mode=self.mode, integer=self.integer)
         result = b.lower(e)
         return b.finish(result)
 
