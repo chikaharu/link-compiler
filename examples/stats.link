@@ -1,0 +1,23 @@
+; stats.link -- input as data, via stdin (linkbin, integer dialect)
+; Input format: n followed by n integers, whitespace separated.
+; The binary contains neither the data nor the answers.
+(program
+  (let n (read-int))
+  (let total 0)
+  (let mx 0)
+  (let mn 0)
+  (for i n
+    (let x (read-int))
+    (if (== i 0)
+      (block (set mx x) (set mn x))
+      (block
+        (if (> x mx) (set mx x) (set mx mx))
+        (if (< x mn) (set mn x) (set mn mn))))
+    (set total (+ total x)))
+  (print "count = " n)
+  (print "sum = " total)
+  (print "max = " mx)
+  (print "min = " mn)
+  (if (> n 0)
+    (print "mean = " (/ total n))
+    (print "mean = 0\n")))

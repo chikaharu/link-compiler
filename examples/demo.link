@@ -1,0 +1,26 @@
+; demo.link -- Link core operations as an AST program
+; inner product / outer product / Gram matrix / cumulative sum / discrete difference
+(program
+  (let a (vec 1.0 2.0 3.0 4.0))
+  (let b (vec 4.0 3.0 2.0 1.0))
+
+  (print "a =" a)
+  (print "b =" b)
+  (print "dot(a,b) =" (dot a b))              ; 1*4+2*3+3*2+4*1 = 20
+  (print "a+b =" (+ a b))
+  (print "2*a =" (* 2.0 a))
+  (print "norm(a) =" (norm a))               ; sqrt(30) = 5.477225575051661
+
+  (print "outer(a,b) =" (outer a b))          ; rank-1 matrix a_i * b_j
+  (print "gram(a,b) =" (gram a b))            ; [[30,20],[20,30]]
+  (print "matvec(outer(a,b),b) =" (matvec (outer a b) b))  ; a*(b.b) = 30a
+
+  (let s (cumsum a))                          ; cumulative-sum operator: [1,3,6,10]
+  (print "cumsum(a) =" s)
+  (print "diff(cumsum(a)) =" (diff s))        ; discrete difference = inverse: back to a
+  (print "roundtrip error =" (norm (- (diff s) a)))
+
+  (let v (iota 5.0))                          ; [0,1,2,3,4]
+  (set-idx v 0.0 10.0)
+  (print "v after set-idx =" v)
+  (print "len(v) =" (len v) " v[0] =" (idx v 0.0)))

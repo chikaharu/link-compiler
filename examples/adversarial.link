@@ -1,0 +1,9 @@
+; adversarial.link -- where the three reduction modes part ways in floating point
+(program
+  (let x 1.0)
+  ; stepwise FP destroys x: (1 + 1e16) - 1e16 = 0. Exact arithmetic says 1.
+  (print "a =" (- (+ x 1e+16) 1e+16))
+  ; stepwise FP overflows: 1e200 * 1e200 = inf. The composed coefficient is ~1.
+  (let big 1e+200)
+  (print "b =" (* (* big 1e+200) 1e-200))
+  (print "c =" (/ (* x 3.0) 3.0)))

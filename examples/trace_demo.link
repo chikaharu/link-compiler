@@ -1,0 +1,8 @@
+; trace_demo.link -- a variable whose trajectory switches rarely.
+; phase cycles 0..39999; s = +1 for the first half of each cycle, -1 after.
+(program
+  (let s 1.0)
+  (for i 100000.0
+    (let phase (mod i 40000.0))
+    (set s (if (< phase 20000.0) 1.0 -1.0)))
+  (print "done"))

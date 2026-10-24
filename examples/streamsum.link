@@ -1,0 +1,15 @@
+; streamsum.link -- read integers from stdin until EOF (linkbin)
+; Same binary, any data: the stream itself is the input.
+(program
+  (let total 0)
+  (let sumsq 0)
+  (let cnt 0)
+  (let x (read-int))
+  (while (== (read-eof?) 0)
+    (set total (+ total x))
+    (set sumsq (+ sumsq (* x x)))
+    (set cnt (+ cnt 1))
+    (set x (read-int)))
+  (print "count = " cnt)
+  (print "sum = " total)
+  (print "sumsq = " sumsq))
