@@ -100,6 +100,76 @@ def seam_cancel(nodes, result, integer=False):
     division, so div-then-multiply pairs never cancel there.
     """
     nodes = [dict(nd) for nd in nodes]
+
+    def const_val_of(nid):
+        if isinstance(nid, int) and nodes[nid]['kind'] == 'const':
+            return nodes[nid]['p']
+        return None
+
+    def same_expr(a, b, memo=None):
+        """Structural equality of two subexpressions. Needed because the
+        lowering does not share nodes: the two occurrences of the same
+        subexpression (e.g. the dividend in a div and a mod) are distinct
+        node ids with identical structure."""
+        if a == b:
+            return True
+        if memo is None:
+            memo = {}
+        if (a, b) in memo:
+            return memo[(a, b)]
+        memo[(a, b)] = False          # guard; the graph is a DAG, no cycles
+        na, nb = nodes[a], nodes[b]
+        if na['kind'] in ('read', 'readeof'):
+            return False              # distinct reads are never the same value
+        ok = (na['kind'] == nb['kind'] and na['name'] == nb['name']
+              and na['p'] == nb['p'] and na['q'] == nb['q'])
+        if ok:
+            xa, xb, sa, sb = na['x'], nb['x'], na['s'], nb['s']
+            ok = (xa is None and xb is None) or \
+                 (xa is not None and xb is not None and same_expr(xa, xb, memo))
+        if ok:
+            if isinstance(sa, tuple) and isinstance(sb, tuple):
+                ok = len(sa) == len(sb) and all(same_expr(x, y, memo) for x, y in zip(sa, sb))
+            elif sa is None or sb is None:
+                ok = sa is None and sb is None
+            else:
+                ok = same_expr(sa, sb, memo)
+        memo[(a, b)] = ok
+        return ok
+
+    def divmod_join(u):
+        """The remainder path is a Link too (integer mode only).
+
+        x = C*(x/C) + (x mod C) is an identity in integer arithmetic
+        (both truncating and floored conventions): the quotient flows
+        through, the remainder flows sideways as a mod Link, and where
+        the two paths join, the pair collapses back to x itself.
+        Returns the input node id when node u is such a join.
+        """
+        nd = nodes[u]
+        if nd['kind'] != 'add':
+            return None
+        for mul_id, mod_id in ((nd['x'], nd['s']), (nd['s'], nd['x'])):
+            if not (isinstance(mul_id, int) and isinstance(mod_id, int)):
+                continue
+            m, r = nodes[mul_id], nodes[mod_id]
+            if r['kind'] != 'mod':
+                continue
+            C = const_val_of(r['s'])
+            if C is None or C == 0:
+                continue
+            d = None
+            if m['kind'] == 'mul' and const_val_of(m['s']) == C:
+                d = m['x']
+            elif m['kind'] == 'aff' and m['q'] == 0.0 and m['p'] == C:
+                d = m['x']
+            if not isinstance(d, int):
+                continue
+            dv = nodes[d]
+            if dv['kind'] == 'div' and same_expr(dv['x'], r['x']) and const_val_of(dv['s']) == C:
+                return r['x']
+        return None
+
     def rewire(old, new):
         nonlocal result
         for nd in nodes:
@@ -115,6 +185,18 @@ def seam_cancel(nodes, result, integer=False):
     changed = True
     while changed:
         changed = False
+        if integer:
+            # divmod joins first: they consume the div/mod pair as a whole.
+            for u in range(len(nodes)):
+                v = divmod_join(u)
+                if v is not None:
+                    rewire(u, v)
+                    nodes[u] = {'kind': 'const', 'x': None, 's': None,
+                                'p': 0.0, 'q': None, 'name': None}
+                    changed = True
+                    break
+            if changed:
+                continue
         for u, nd in enumerate(nodes):
             if nd['x'] is None:
                 continue
