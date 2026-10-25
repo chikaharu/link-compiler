@@ -272,6 +272,36 @@ demo_bytes / stats / streamsum（stdin、空入力・EOF終端含む）は全て
 66 → 29 Link に縮約しつつ出力は plain と完全一致（j=100, -100, 120、
 不一致側は 98 と 104 のまま）。整数 fuzz は合流パターン注入込み150件で不一致0。
 
+## v0.9 境界縮約に証明書を付ける — 生成と検査の分離（linkcheck.py、2026-10-26）
+
+QED Script の設計（プログラムと証明は別々に作り、小さい独立検証器が
+検査する）を境界縮約に適用した。`seam_cancel` は打ち消しのたびに
+証明書ステップ（規則名・関係ノード・置き換え先・係数の証人）を記録し、
+新規モジュール `linkcheck.py` がそれを再生検証する。チェッカーは
+コンパイラを import せず、信用するのはノード形式と再生規則と有理数
+演算だけである。
+
+```sh
+python3 linkir.py examples/adversarial.link --mode boundary \
+    --certify cert.json --check     # 生成と同時に独立検証
+python3 linkcheck.py cert.json      # VALID / INVALID を単独判定
+```
+
+- 係数の検証は、書かれた10進定数を有理数として読む厳密演算
+  （`Fraction(repr(x))`）で行う ―― コンパイラの公称意味論
+  「実数演算で厳密」と一致させるため
+- モード権限も検査する：実数除算に依存する規則（div-mul、
+  div-mul-const）は整数証明書では棄却、divmod合流は整数でのみ受理
+- 検証範囲は境界縮約の全規則（aff-aff、恒等Link、定数 mul/div、
+  クロストーク対、exp/log、divmod合流）
+
+検証（2026-10-26）：`test_linkcheck.py` の30件が全合格 ―― 収録例6件の
+証明書受理、規則ごとの埋め込みケース、整数モードの偽造証明書の棄却、
+fuzz 60件（埋め込みプログラム）の受理と値の保存、証明書の改変6種
+（証人の係数・規則名・置き換え先・ステップ削除・縮約結果・元の
+ノード）の全棄却。既存の検証値（affine.link 34→19/22、
+adversarial の a=1, b=1e200）も不変。
+
 ## 次の段階の候補
 
 1. SVD/eigh をLink演算として追加し、PCA持ち上げ実験を `.link` で書き直す

@@ -80,7 +80,7 @@ def gc_nodes(nodes, result):
         out.append(nd)
     return out, remap[result]
 
-def seam_cancel(nodes, result, integer=False):
+def seam_cancel(nodes, result, integer=False, cert=None):
     """Boundary reduction: cancel exactly-inverse pairs at their seam.
 
     No interval is ever composed. Two adjacent links are erased only when
@@ -98,6 +98,12 @@ def seam_cancel(nodes, result, integer=False):
     integer=True (for linkbin's integer dialect) disables every rule whose
     exactness relies on real division: (x / C) * C is NOT x in integer
     division, so div-then-multiply pairs never cancel there.
+
+    cert: if a list is passed, every cancellation is recorded into it as
+    a step dict (rule name, the node ids involved, the replacement, and
+    the exact coefficient witnesses as decimal strings). The independent
+    checker in linkcheck.py replays these steps in rational arithmetic;
+    this function only *produces* the certificate, never vouches for it.
     """
     nodes = [dict(nd) for nd in nodes]
 
@@ -167,7 +173,7 @@ def seam_cancel(nodes, result, integer=False):
                 continue
             dv = nodes[d]
             if dv['kind'] == 'div' and same_expr(dv['x'], r['x']) and const_val_of(dv['s']) == C:
-                return r['x']
+                return r['x'], {'mul': mul_id, 'mod': mod_id, 'div': d, 'C': C}
         return None
 
     def rewire(old, new):
@@ -188,8 +194,13 @@ def seam_cancel(nodes, result, integer=False):
         if integer:
             # divmod joins first: they consume the div/mod pair as a whole.
             for u in range(len(nodes)):
-                v = divmod_join(u)
-                if v is not None:
+                found = divmod_join(u)
+                if found is not None:
+                    v, info = found
+                    if cert is not None:
+                        cert.append({'rule': 'divmod-join', 'upper': u, 'repl': v,
+                                     'mul': info['mul'], 'mod': info['mod'],
+                                     'div': info['div'], 'C': repr(info['C'])})
                     rewire(u, v)
                     nodes[u] = {'kind': 'const', 'x': None, 's': None,
                                 'p': 0.0, 'q': None, 'name': None}
@@ -202,16 +213,20 @@ def seam_cancel(nodes, result, integer=False):
                 continue
             l = nodes[nd['x']]
             repl = None
+            rule = None
             if nd['kind'] == 'aff' and nd['p'] == 1.0 and nd['q'] == 0.0:
                 repl = nd['x']
+                rule = 'identity-aff'
             elif nd['kind'] == 'aff' and l['kind'] == 'aff':
                 if nd['p'] * l['p'] == 1.0 and nd['p'] * l['q'] + nd['q'] == 0.0:
                     repl = l['x']
+                    rule = 'aff-aff'
             elif nd['kind'] == 'div' and l['kind'] == 'aff' and l['q'] == 0.0:
                 # (x * C) / C with the *same constant value* C: the seam joins.
                 sn = nodes[nd['s']] if isinstance(nd['s'], int) else None
                 if sn is not None and sn['kind'] == 'const' and sn['p'] == l['p']:
                     repl = l['x']
+                    rule = 'mul-div-const'
             elif nd['kind'] == 'aff' and nd['q'] == 0.0 and l['kind'] == 'div' and not integer:
                 # (x / C) * C with the same constant value C.
                 # Real arithmetic only: forbidden in integer mode, where
@@ -219,6 +234,7 @@ def seam_cancel(nodes, result, integer=False):
                 sn = nodes[l['s']] if isinstance(l['s'], int) else None
                 if sn is not None and sn['kind'] == 'const' and sn['p'] == nd['p']:
                     repl = l['x']
+                    rule = 'div-mul-const'
             elif ((l['kind'], nd['kind']) in (('add', 'sub'), ('sub', 'add'),
                                                ('mul', 'div'))
                   or ((l['kind'], nd['kind']) == ('div', 'mul') and not integer)):
@@ -226,10 +242,26 @@ def seam_cancel(nodes, result, integer=False):
                 # case: integer division is not invertible.
                 if l['s'] is not None and l['s'] == nd['s']:
                     repl = l['x']
+                    rule = f"{l['kind']}-{nd['kind']}"
             elif l['kind'] == 'fn' and nd['kind'] == 'fn':
                 if {l['name'], nd['name']} == {'exp', 'log'}:
                     repl = l['x']
+                    rule = 'exp-log'
             if repl is not None:
+                if cert is not None:
+                    step = {'rule': rule, 'upper': u, 'lower': nd['x'], 'repl': repl}
+                    if rule == 'identity-aff':
+                        step.update({'p': repr(nd['p']), 'q': repr(nd['q'])})
+                    elif rule == 'aff-aff':
+                        step.update({'p1': repr(l['p']), 'q1': repr(l['q']),
+                                     'p2': repr(nd['p']), 'q2': repr(nd['q'])})
+                    elif rule in ('mul-div-const', 'div-mul-const'):
+                        step['C'] = repr(l['p'] if rule == 'mul-div-const' else nd['p'])
+                    elif rule in ('add-sub', 'sub-add', 'mul-div', 'div-mul'):
+                        step['s'] = nd['s']
+                    elif rule == 'exp-log':
+                        step.update({'lower_name': l['name'], 'upper_name': nd['name']})
+                    cert.append(step)
                 rewire(u, repl)
                 nodes[u] = {'kind': 'const', 'x': None, 's': None, 'p': 0.0, 'q': None, 'name': None}
                 changed = True
@@ -243,11 +275,12 @@ class Builder:
                         inverse pairs are cancelled afterwards at their seams
           'interval' -- additionally, affine chains are composed (interval reduction)
     """
-    def __init__(self, mode='interval', integer=False):
+    def __init__(self, mode='interval', integer=False, cert_sink=None):
         self.nodes = []          # dicts: kind, x, s, p, q, name
         self.const_val = {}      # node id -> float, when known constant
         self.norm = {}           # node id -> (base_id, p, q): value = p*base + q
         self.mode = mode
+        self.cert_sink = cert_sink
         self.reduce = (mode != 'none')
         # integer=True: target is linkbin's integer dialect. Constant
         # folding is disabled (floats cannot fold i64 arithmetic exactly),
@@ -362,18 +395,31 @@ class Builder:
     def finish(self, result):
         """Boundary pass if requested, then drop dead links and renumber."""
         if self.mode == 'boundary':
-            return seam_cancel(self.nodes, result, integer=self.integer)
+            if self.cert_sink is None:
+                return seam_cancel(self.nodes, result, integer=self.integer)
+            pre = [dict(nd) for nd in self.nodes]
+            steps = []
+            reduced = seam_cancel(self.nodes, result, integer=self.integer,
+                                  cert=steps)
+            self.cert_sink.append({'nodes': pre, 'result': result,
+                                   'steps': steps,
+                                   'reduced_nodes': reduced[0],
+                                   'reduced_result': reduced[1],
+                                   'integer': self.integer})
+            return reduced
         return gc_nodes(self.nodes, result)
 
 # ------------------------------------------------------------- statements
 
 class Lower:
-    def __init__(self, mode='interval', integer=False):
+    def __init__(self, mode='interval', integer=False, cert_sink=None):
         self.mode = mode
         self.integer = integer
+        self.cert_sink = cert_sink
 
     def expr(self, e):
-        b = Builder(mode=self.mode, integer=self.integer)
+        b = Builder(mode=self.mode, integer=self.integer,
+                    cert_sink=self.cert_sink)
         result = b.lower(e)
         return b.finish(result)
 
@@ -590,11 +636,32 @@ def main():
                     help='record every value assigned to NAME, then boundary-analyse the trajectory')
     ap.add_argument('--emit-ast', metavar='PATH',
                     help='write the reduced program back as a .link AST (consumable by linkc)')
+    ap.add_argument('--certify', metavar='PATH',
+                    help='(boundary mode) write a certificate of every seam '
+                         'cancellation to PATH as JSON; see linkcheck.py')
+    ap.add_argument('--check', action='store_true',
+                    help='with --certify: verify the certificate with the '
+                         'independent checker before writing it')
     a = ap.parse_args()
 
     with open(a.source) as f:
         stmts = parse(f.read())
-    reduced = Lower(mode=a.mode).program(stmts)
+    cert_sink = [] if a.certify else None
+    reduced = Lower(mode=a.mode, cert_sink=cert_sink).program(stmts)
+    if a.certify:
+        import json
+        data = {'version': 1, 'expressions': json.loads(json.dumps(cert_sink))}
+        if a.check:
+            from linkcheck import check_cert_data
+            ok, reason = check_cert_data(data)
+            print(f'[linkir] certificate check: {"OK" if ok else "FAILED: " + reason}')
+            if not ok:
+                sys.exit(1)
+        with open(a.certify, 'w') as f:
+            json.dump(data, f, indent=1)
+        n_steps = sum(len(e['steps']) for e in cert_sink)
+        print(f'[linkir] certificate written to {a.certify} '
+              f'({len(cert_sink)} expressions, {n_steps} certified steps)')
     if a.emit_ast:
         from linkemit import emit_program, to_source
         with open(a.emit_ast, 'w') as f:
