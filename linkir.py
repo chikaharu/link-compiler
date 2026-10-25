@@ -1464,21 +1464,21 @@ class Interp:
         return str(int(v)) if float(v) == int(v) and abs(v) < 1e16 else repr(v)
 
     @staticmethod
+    def _poly_at(poly, ov, shift, i):
+        if i in ov:
+            return ov[i]
+        acc = 0.0
+        for c in reversed(poly):
+            acc = acc * i + c
+        return acc + shift
+
+    @staticmethod
     def _factor_vals(desc):
         """Element values of a symbolic factor, for printing."""
         if desc[0] == 'vals':
             return list(desc[1])
         _, n, poly, ov, shift = desc
-        out = []
-        for i in range(n):
-            if i in ov:
-                out.append(ov[i])
-            else:
-                acc = 0.0
-                for c in reversed(poly):
-                    acc = acc * i + c
-                out.append(acc + shift)
-        return out
+        return [Interp._poly_at(poly, ov, shift, i) for i in range(n)]
 
     @staticmethod
     def fmt_debug(v):
@@ -1517,18 +1517,12 @@ class Interp:
                     line.append('[' + ', '.join(
                         self.fmt_debug(self.eval(e)) for e in payload) + ']')
                 elif tag == 'symvec':
+                    # streamed: elements are generated one at a time
+                    # (never held as a list), however large n is
                     n, poly, ov, shift = payload
-                    vals = []
-                    for i in range(n):
-                        if i in ov:
-                            vals.append(ov[i])
-                        else:
-                            acc = 0.0
-                            for c in reversed(poly):
-                                acc = acc * i + c
-                            vals.append(acc + shift)
                     line.append('[' + ', '.join(
-                        self.fmt_debug(x) for x in vals) + ']')
+                        self.fmt_debug(self._poly_at(poly, ov, shift, i))
+                        for i in range(n)) + ']')
                 elif tag == 'symmat':
                     fa, fb, coef = payload
                     rows = self._factor_vals(fa)
