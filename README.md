@@ -326,6 +326,35 @@ linkc が受理する命令のうち linkir が落ちていたもの（`vec`/`io
 動的 set-idx エラーの明示。既存テスト（test_linkcheck.py 30件、
 affine.link 34→19/22、linkbin/linkc の出力）も不変。
 
+## v0.11 非展開のまま無制限に — rankop形式の記号ベクトル・行列（2026-10-26）
+
+v0.10 の展開上限（100,000要素）は、**展開しなければ**不要だった。
+ユーザーの rankop（ランク1作用素 α·u·vᵀ を対数空間のスカラーだけで
+追跡するライブラリ）の発想を linkir に入れ、2つの記号形式を追加した。
+
+- **symvec（添字多項式）**：要素が添字 i の多項式 P(i)（Fraction の
+  厳密係数）で与えられるベクトル。`iota`/`zeros`/`ones` が生成元で、
+  `+`/`-`/定数倍/`cumsum`/`diff` で閉じる（diff の先頭要素などの例外は
+  有限個の「上書き」として保持し、n には比例しない）。内積は
+  Faulhaber の閉形式（Bernoulli数）で厳密に計算され、要素数 n は
+  記録されるだけの数になる
+- **symmat（rankop形式）**：`outer` は coef·a·bᵀ の因子対のまま保持。
+  `matmul` は内積1つで因子を組み替え（(abᵀ)(cdᵀ) = (b·c)·adᵀ）、
+  `matvec` は a·(b·x)、ノルムは rankop の log_sigma
+  （log|coef| + log‖a‖ + log‖b‖、safe-sigma の上限つき）。内積が
+  0 の積は dead な作用素として 0 になる
+
+上限が残るのは「実体化」の境界だけ：変数を含むベクトルとの混合演算、
+要素別関数、動的添字、`set-idx`（記号束縛を要素変数へ実体化する）。
+多項式の次数上限は12。
+
+検証（2026-10-26）：`test_linkir_sym.py` 全合格 ―― bench.link の
+10⁶ 本ベクトル部が **2ノード** に落ち、cumsum_last = 499999500000・
+roundtrip_err = 0 を厳密に返す。symmat のノルムはユーザーの
+rankop.py 本体の log_sigma と一致（相対誤差 < 1e-9）。ランダムな
+記号式40件＋行列鎖10件が参照評価器と一致。既存テスト群
+（linkcheck 30件・vec 13件・demo のバイト一致）も不変。
+
 ## 次の段階の候補
 
 1. SVD/eigh をLink演算として追加し、PCA持ち上げ実験を `.link` で書き直す

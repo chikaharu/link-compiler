@@ -51,9 +51,259 @@ FN1 = {'sqrt': math.sqrt, 'exp': math.exp, 'log': math.log,
 
 # Vectors and matrices are decomposed into 1x1 Links by unrolling, so a
 # compile-time-known size is required. The cap keeps the decomposition
-# a decomposition (bulk pipelines of 1e6 elements belong to linkc's
-# native Vec code, not to an unrolled IR).
+# a decomposition. Values that stay inside the symbolic world below
+# (index polynomials / rank-1 factors) are NOT subject to this cap:
+# only materialising them into nodes is.
 MAX_UNROLL = 100_000
+
+# --------------------------------------------------- symbolic forms
+# A symbolic vector ('symvec') has elements P(i) where P is a polynomial
+# in the index with exact Fraction coefficients (iota, zeros, ones and
+# everything closed under +, -, scalar *, cumsum, diff). Its dot
+# products are Faulhaber closed forms, so no operation in this world
+# ever touches n elements: the size is a recorded number, not data.
+# A symbolic matrix ('symmat') is rank-1 in the rankop sense:
+# coef * a b^T with a, b symbolic or explicit factors, the scalar
+# bookkeeping (inner products, norms) done in closed form / log space.
+from fractions import Fraction
+from math import comb as _comb
+
+MAX_DEG = 12          # highest index-polynomial degree kept symbolic
+
+
+def _bernoulli_numbers(m):
+    B = [Fraction(0)] * (m + 1)
+    B[0] = Fraction(1)
+    for k in range(1, m + 1):
+        s = sum(_comb(k + 1, j) * B[j] for j in range(k))
+        B[k] = -s / (k + 1)
+    return B
+
+
+_BERN = _bernoulli_numbers(40)
+
+
+def _bern_poly(m):
+    coeffs = [Fraction(0)] * (m + 1)
+    for j in range(m + 1):
+        coeffs[m - j] += _comb(m, j) * _BERN[j]
+    return coeffs
+
+
+def _power_sum_poly(p):
+    """S_p(x) = sum_{i=0}^{x-1} i^p as a polynomial in x."""
+    bp = _bern_poly(p + 1)
+    bp[0] -= _BERN[p + 1]
+    return [c / (p + 1) for c in bp]
+
+
+def _padd(a, b):
+    n = max(len(a), len(b))
+    z = Fraction(0)
+    return [(a[i] if i < len(a) else z) + (b[i] if i < len(b) else z)
+            for i in range(n)]
+
+
+def _psub(a, b):
+    return _padd(a, [-c for c in b])
+
+
+def _pmul(a, b):
+    out = [Fraction(0)] * (len(a) + len(b) - 1)
+    for i, x in enumerate(a):
+        if x:
+            for j, y in enumerate(b):
+                out[i + j] += x * y
+    return out
+
+
+def _pscale(a, s):
+    return [c * s for c in a]
+
+
+def _peval(a, x):
+    acc = Fraction(0)
+    for c in reversed(a):
+        acc = acc * x + c
+    return acc
+
+
+def _pshift(a, h):
+    """P(i + h) as a polynomial in i."""
+    out = [Fraction(0)]
+    pw = [Fraction(1)]
+    base = [Fraction(h), Fraction(1)]
+    for k, c in enumerate(a):
+        if k > 0:
+            pw = _pmul(pw, base)
+        if c:
+            out = _padd(out, _pscale(pw, c))
+    return out
+
+
+def _pcumsum(a):
+    """Q(i) = sum_{j=0}^{i} P(j)."""
+    s = [Fraction(0)]
+    for p, c in enumerate(a):
+        if c:
+            s = _padd(s, _pscale(_power_sum_poly(p), c))
+    return _pshift(s, 1)
+
+
+def _pdiff(a):
+    """P(i) - P(i-1) (with the boundary convention diff[0] = P(0),
+    handled by callers keeping the first element, as in the unrolled
+    path: pdiff applies for i >= 1; at i = 0 the caller substitutes
+    peval(P, 0))."""
+    return _psub(a, _pshift(a, -1))
+
+
+def _range_dot(a, b, n):
+    """sum_{i=0}^{n-1} P(i) Q(i), exact (Faulhaber)."""
+    pq = _pmul(a, b)
+    total = Fraction(0)
+    for p, c in enumerate(pq):
+        if c:
+            total += c * _peval(_power_sum_poly(p), Fraction(n))
+    return total
+
+
+def _pdeg(a):
+    d = len(a) - 1
+    while d > 0 and a[d] == 0:
+        d -= 1
+    return d
+
+
+def _frac_of_float(v):
+    """A written decimal constant as an exact rational (the checker's
+    semantics: Fraction(repr(v)))."""
+    return Fraction(repr(v))
+
+
+# A symbolic vector value is (poly, overrides, shift): element i is
+# overrides[i] when present, else peval(poly, i) + shift. Overrides
+# hold the finitely many head elements where an operation (diff) is
+# not given by the tail polynomial; they never grow with n.
+def _selem(sv, i):
+    poly, ov, shift = sv
+    if i in ov:
+        return ov[i]
+    return _peval(poly, Fraction(i)) + shift
+
+
+def _sfold(sv):
+    """Fold the shift into the polynomial's constant term."""
+    poly, ov, shift = sv
+    if shift == 0:
+        return sv
+    p = list(poly)
+    if not p:
+        p = [Fraction(0)]
+    p[0] += shift
+    return (p, ov, Fraction(0))
+
+
+def _scheck_deg(poly):
+    if _pdeg(poly) > MAX_DEG:
+        raise TypeError(f'linkir: index polynomial degree {_pdeg(poly)} '
+                        f'exceeds the symbolic limit ({MAX_DEG})')
+
+
+def _sadd(a, b):
+    pa, pb = _sfold(a), _sfold(b)
+    ov = {}
+    for i in set(pa[1]) | set(pb[1]):
+        ov[i] = _selem(pa, i) + _selem(pb, i)
+    poly = _padd(pa[0], pb[0])
+    _scheck_deg(poly)
+    return (poly, ov, Fraction(0))
+
+
+def _ssub(a, b):
+    return _sadd(a, _sscale(b, Fraction(-1)))
+
+
+def _sscale(a, s):
+    if s == 0:
+        return ([Fraction(0)], {}, Fraction(0))
+    poly, ov, shift = a
+    return (_pscale(poly, s), {i: v * s for i, v in ov.items()},
+            shift * s)
+
+
+def _smul(a, b):
+    pa, pb = _sfold(a), _sfold(b)
+    ov = {}
+    for i in set(pa[1]) | set(pb[1]):
+        ov[i] = _selem(pa, i) * _selem(pb, i)
+    poly = _pmul(pa[0], pb[0])
+    _scheck_deg(poly)
+    return (poly, ov, Fraction(0))
+
+
+def _scumsum(sv):
+    poly, ov, shift = _sfold(sv)
+    tail = poly
+    q = _pcumsum(tail)
+    _scheck_deg(q)
+    if not ov:
+        return (q, {}, Fraction(0))
+    K = max(ov)
+    # At override indices the running sum differs from the tail formula
+    # by the accumulated deltas; past K that difference is constant.
+    deltas = {j: ov[j] - _peval(tail, Fraction(j)) for j in ov}
+    total_delta = sum(deltas.values(), Fraction(0))
+    out_ov = {}
+    run = Fraction(0)
+    for i in range(K + 1):
+        run += _selem(sv, i)
+        out_ov[i] = run
+    return (q, out_ov, total_delta)
+
+
+def _sdiff(sv):
+    poly, ov, shift = _sfold(sv)
+    tail = _pdiff(poly)
+    K = max(ov) if ov else -1
+    out_ov = {}
+    for i in range(K + 2):
+        prev = _selem(sv, i - 1) if i >= 1 else None
+        out_ov[i] = _selem(sv, i) if i == 0 else _selem(sv, i) - prev
+    # out_ov[0] keeps the first element (boundary convention); indices
+    # up to K+1 may deviate from the tail polynomial.
+    clean = {i: v for i, v in out_ov.items()
+             if v != _peval(tail, Fraction(i))}
+    return (tail, clean, Fraction(0))
+
+
+def _sdot(a, b, n):
+    pa, pb = _sfold(a), _sfold(b)
+    total = _range_dot(pa[0], pb[0], n)
+    for i in set(pa[1]) | set(pb[1]):
+        if i < n:
+            total += _selem(pa, i) * _selem(pb, i) \
+                - _peval(pa[0], Fraction(i)) * _peval(pb[0], Fraction(i))
+    return total
+
+
+def _svals(vals):
+    """A symbolic vector from explicit constant values (stored as
+    head overrides over the zero polynomial)."""
+    return ([Fraction(0)],
+            {i: v for i, v in enumerate(vals) if v != 0},
+            Fraction(0))
+
+
+def _sadd_const(sv, c):
+    """Add a constant to every element (through the polynomial's
+    constant term; the shift is part of the tail value and stays)."""
+    if c == 0:
+        return sv
+    poly, ov, shift = sv
+    p = list(poly) if poly else [Fraction(0)]
+    p[0] = p[0] + c
+    return (p, {i: v + c for i, v in ov.items()}, shift)
 
 def gc_nodes(nodes, result):
     """Drop unreachable nodes, renumber. Returns (nodes, result)."""
@@ -282,7 +532,7 @@ class Builder:
           'interval' -- additionally, affine chains are composed (interval reduction)
     """
     def __init__(self, mode='interval', integer=False, cert_sink=None,
-                 shapes=None):
+                 shapes=None, sym=None, syms=None):
         self.nodes = []          # dicts: kind, x, s, p, q, name
         self.const_val = {}      # node id -> float, when known constant
         self.norm = {}           # node id -> (base_id, p, q): value = p*base + q
@@ -292,6 +542,10 @@ class Builder:
         # bound to vectors/matrices; shared across a whole program so
         # later statements can materialise element variables (name__i).
         self.shapes = shapes if shapes is not None else {}
+        # sym: name -> (n, symvec) and syms: name -> symmat, for
+        # variables bound to symbolic values (no nodes at all).
+        self.sym = sym if sym is not None else {}
+        self.syms = syms if syms is not None else {}
         self.reduce = (mode != 'none')
         # integer=True: target is linkbin's integer dialect. Constant
         # folding is disabled (floats cannot fold i64 arithmetic exactly),
@@ -372,8 +626,8 @@ class Builder:
         if isinstance(e, Str):
             raise TypeError('string inside expression')
         if isinstance(e, str):
-            if e in self.shapes:
-                raise TypeError(f'linkir: {e} is a {self.shapes[e][0]}, '
+            if e in self.sym or e in self.syms or e in self.shapes:
+                raise TypeError(f'linkir: {e} is a vector/matrix, '
                                 'not a scalar')
             return self.add('var', name=e)
         if isinstance(e, list) and e and e[0] in (
@@ -423,7 +677,7 @@ class Builder:
                 f'linkir: {n} elements exceed the 1x1 unroll limit '
                 f'({MAX_UNROLL}); use linkc for bulk vectors')
 
-    def _static_size(self, e):
+    def _size_of(self, e, capped=True):
         nid = self.lower(e)
         if not self.is_const(nid):
             raise TypeError('linkir: vector size must be a compile-time '
@@ -431,7 +685,8 @@ class Builder:
         n = int(self.const_val[nid])
         if n < 0:
             raise TypeError('linkir: negative vector size')
-        self._check_size(n)
+        if capped:
+            self._check_size(n)
         return n
 
     def _dot(self, a, b):
@@ -441,7 +696,112 @@ class Builder:
             acc = p if acc is None else self.mk_bin('add', acc, p)
         return acc if acc is not None else self.const(0.0)
 
+    # -------------------------------------- symbolic value helpers
+    def materialize_symvec(self, n, sv):
+        """Nodes for a symbolic vector's elements (cap applies: this
+        is where the symbolic world pays for materialisation)."""
+        self._check_size(n)
+        return ('vec', [self.const(float(_selem(sv, i)))
+                        for i in range(n)])
+
+    def _factor_of(self, v):
+        """A rank-1 factor from a vector value: ('poly', n, sv) for a
+        symbolic vector, ('vals', [Fraction]) for an all-constant
+        unrolled vector, else None."""
+        if v[0] == 'symvec':
+            return ('poly', v[1], v[2])
+        if v[0] == 'vec' and all(self.is_const(el) for el in v[1]):
+            return ('vals', [_frac_of_float(self.const_val[el])
+                             for el in v[1]])
+        return None
+
+    @staticmethod
+    def _flen(f):
+        return f[1] if f[0] == 'poly' else len(f[1])
+
+    def _fdot(self, fa, fb):
+        if self._flen(fa) != self._flen(fb):
+            raise TypeError('linkir: factor length mismatch')
+        if fa[0] == 'poly' and fb[0] == 'poly':
+            return _sdot(fa[2], fb[2], fa[1])
+        if fa[0] == 'vals' and fb[0] == 'vals':
+            return sum((x * y for x, y in zip(fa[1], fb[1])),
+                       Fraction(0))
+        if fa[0] == 'vals':
+            fa, fb = fb, fa
+        return sum((_selem(fa[2], i) * fb[1][i]
+                    for i in range(len(fb[1]))), Fraction(0))
+
+    def _fscale(self, f, s):
+        if f[0] == 'poly':
+            return ('poly', f[1], _sscale(f[2], s))
+        return ('vals', [v * s for v in f[1]])
+
+    def _fvalue(self, f):
+        """A factor as a value: symbolic if poly, else const nodes."""
+        if f[0] == 'poly':
+            return ('symvec', f[1], f[2])
+        return ('vec', [self.const(float(v)) for v in f[1]])
+
+    def _fnodes(self, f):
+        if f[0] == 'poly':
+            return self.materialize_symvec(f[1], f[2])[1]
+        return [self.const(float(v)) for v in f[1]]
+
+    def _fdesc(self, f):
+        if f[0] == 'poly':
+            poly, ov, shift = f[2]
+            return ('poly', f[1], tuple(float(c) for c in poly),
+                    {i: float(v) for i, v in ov.items()}, float(shift))
+        return ('vals', tuple(float(v) for v in f[1]))
+
+    def _symmat_vec(self, m, v):
+        """matvec on a rank-1 symbolic matrix: coef * a * (b . x)."""
+        _, fa, fb, coef = m
+        fx = self._factor_of(v)
+        if fx is not None:
+            s = coef * self._fdot(fb, fx)
+            return self._fvalue(self._fscale(fa, s))
+        if v[0] != 'vec':
+            raise TypeError('linkir: matvec shape mismatch')
+        b_nodes = self._fnodes(fb)      # len == len(v), which is <= cap
+        s = self._dot(b_nodes, v[1])
+        if coef != 1:
+            s = self.mk_bin('mul', self.const(float(coef)), s)
+        a_nodes = self._fnodes(fa)      # rows: cap applies
+        return ('vec', [self.mk_bin('mul', s, el) for el in a_nodes])
+
+    def _symmat_norm(self, m):
+        """rankop log-space sigma: ||coef * a b^T||_F = |coef| ||a|| ||b||,
+        computed as exp(log|coef| + log||a|| + log||b||) with the
+        safe-sigma cap of rankop.py (log > 700 -> inf)."""
+        _, fa, fb, coef = m
+        if coef == 0:
+            return self.const(0.0)
+        la = 0.5 * math.log(float(self._fdot(fa, fa)))
+        lb = 0.5 * math.log(float(self._fdot(fb, fb)))
+        ls = math.log(abs(float(coef))) + la + lb
+        if ls > 700.0:
+            return self.const(float('inf'))
+        return self.const(math.exp(ls))
+
+    def _materialize_symmat(self, m):
+        _, fa, fb, coef = m
+        rows, cols = self._flen(fa), self._flen(fb)
+        self._check_size(rows * cols)
+        a_vals = [_selem(fa[2], i) if fa[0] == 'poly' else fa[1][i]
+                  for i in range(rows)]
+        b_vals = [_selem(fb[2], j) if fb[0] == 'poly' else fb[1][j]
+                  for j in range(cols)]
+        return ('mat', [[self.const(float(coef * a_vals[i] * b_vals[j]))
+                         for j in range(cols)] for i in range(rows)])
+
     def lower_any(self, e):
+        if isinstance(e, str) and e in self.sym:
+            n, sv = self.sym[e]
+            return ('symvec', n, sv)
+        if isinstance(e, str) and e in self.syms:
+            return self.syms[e]
         if isinstance(e, str) and e in self.shapes:
             kind, shape = self.shapes[e]
             if kind == 'vec':
@@ -463,17 +823,41 @@ class Builder:
             self._check_size(len(elems))
             return ('vec', elems)
         if op in ('zeros', 'ones', 'iota'):
-            n = self._static_size(args[0])
-            return ('vec', [self.const(float(i) if op == 'iota'
-                                        else (0.0 if op == 'zeros' else 1.0))
-                            for i in range(n)])
+            n = self._size_of(args[0], capped=False)
+            if op == 'zeros':
+                sv = ([Fraction(0)], {}, Fraction(0))
+            elif op == 'ones':
+                sv = ([Fraction(1)], {}, Fraction(0))
+            else:
+                sv = ([Fraction(0), Fraction(1)], {}, Fraction(0))
+            return ('symvec', n, sv)
         if op == 'len':
             v = self.lower_any(args[0])
             if v[0] == 'scalar':
                 raise TypeError('linkir: len of a scalar')
+            if v[0] == 'symvec':
+                return ('scalar', self.const(float(v[1])))
+            if v[0] == 'symmat':
+                return ('scalar', self.const(float(self._flen(v[1]))))
             return ('scalar', self.const(float(len(v[1]))))
         if op == 'idx':
             v = self.lower_any(args[0])
+            if v[0] == 'symvec':
+                iv = self.lower(args[1])
+                if self.is_const(iv):
+                    i = int(self.const_val[iv])
+                    if not (0 <= i < v[1]):
+                        raise TypeError(f'linkir: idx {i} out of range')
+                    return ('scalar', self.const(float(_selem(v[2], i))))
+                # dynamic index: needs the elements as nodes
+                v = self.materialize_symvec(v[1], v[2])
+                elems = v[1]
+                acc = elems[-1]
+                for i in range(len(elems) - 2, -1, -1):
+                    c = self.add('cmp', x=iv, s=self.const(float(i)),
+                                 name='==')
+                    acc = self.add('if', x=c, s=(elems[i], acc))
+                return ('scalar', acc)
             if v[0] != 'vec':
                 raise TypeError('linkir: idx expects a vector')
             elems = v[1]
@@ -490,17 +874,37 @@ class Builder:
             return ('scalar', acc)
         if op == 'dot':
             a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            fa, fb = self._factor_of(a), self._factor_of(b)
+            if fa is not None and fb is not None:
+                return ('scalar', self.const(float(self._fdot(fa, fb))))
+            if a[0] == 'symvec':
+                a = self.materialize_symvec(a[1], a[2])
+            if b[0] == 'symvec':
+                b = self.materialize_symvec(b[1], b[2])
             if a[0] != 'vec' or b[0] != 'vec' or len(a[1]) != len(b[1]):
                 raise TypeError('linkir: dot expects two vectors of '
                                 'equal length')
             return ('scalar', self._dot(a[1], b[1]))
         if op == 'norm':
             a = self.lower_any(args[0])
+            if a[0] == 'symvec':
+                fa = self._factor_of(a)
+                return ('scalar', self.const(
+                    math.sqrt(float(self._fdot(fa, fa)))))
+            if a[0] == 'symmat':
+                return ('scalar', self._symmat_norm(a))
             if a[0] != 'vec':
                 raise TypeError('linkir: norm expects a vector')
             return ('scalar', self.mk_fn('sqrt', self._dot(a[1], a[1])))
         if op == 'outer':
             a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            fa, fb = self._factor_of(a), self._factor_of(b)
+            if fa is not None and fb is not None:
+                return ('symmat', fa, fb, Fraction(1))
+            if a[0] == 'symvec':
+                a = self.materialize_symvec(a[1], a[2])
+            if b[0] == 'symvec':
+                b = self.materialize_symvec(b[1], b[2])
             if a[0] != 'vec' or b[0] != 'vec':
                 raise TypeError('linkir: outer expects two vectors')
             self._check_size(len(a[1]) * len(b[1]))
@@ -508,18 +912,36 @@ class Builder:
                             for x in a[1]])
         if op == 'gram':
             vs = [self.lower_any(a) for a in args]
+            fs = [self._factor_of(v) for v in vs]
+            if all(f is not None for f in fs):
+                return ('mat', [[self.const(float(self._fdot(u, w)))
+                                 for w in fs] for u in fs])
+            vs = [self.materialize_symvec(v[1], v[2])
+                  if v[0] == 'symvec' else v for v in vs]
             if any(v[0] != 'vec' for v in vs):
                 raise TypeError('linkir: gram expects vectors')
             return ('mat', [[self._dot(u[1], w[1]) for w in vs]
                             for u in vs])
         if op == 'matvec':
             m, v = self.lower_any(args[0]), self.lower_any(args[1])
-            if m[0] != 'mat' or v[0] != 'vec' \
-                    or (m[1] and len(m[1][0]) != len(v[1])):
+            if m[0] == 'symmat':
+                return self._symmat_vec(m, v)
+            if m[0] != 'mat':
+                raise TypeError('linkir: matvec expects a matrix')
+            if v[0] == 'symvec':
+                v = self.materialize_symvec(v[1], v[2])
+            if v[0] != 'vec' or (m[1] and len(m[1][0]) != len(v[1])):
                 raise TypeError('linkir: matvec shape mismatch')
             return ('vec', [self._dot(row, v[1]) for row in m[1]])
         if op == 'matmul':
             a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            if a[0] == 'symmat' and b[0] == 'symmat':
+                inner = self._fdot(a[2], b[1])
+                return ('symmat', a[1], b[2], a[3] * inner * b[3])
+            if a[0] == 'symmat':
+                a = self._materialize_symmat(a)
+            if b[0] == 'symmat':
+                b = self._materialize_symmat(b)
             if a[0] != 'mat' or b[0] != 'mat' \
                     or (a[1] and len(a[1][0]) != len(b[1])):
                 raise TypeError('linkir: matmul shape mismatch')
@@ -528,11 +950,15 @@ class Builder:
                             for row in a[1]])
         if op == 'transpose':
             m = self.lower_any(args[0])
+            if m[0] == 'symmat':
+                return ('symmat', m[2], m[1], m[3])
             if m[0] != 'mat':
                 raise TypeError('linkir: transpose expects a matrix')
             return ('mat', [list(row) for row in zip(*m[1])])
         if op == 'cumsum':
             v = self.lower_any(args[0])
+            if v[0] == 'symvec':
+                return ('symvec', v[1], _scumsum(v[2]))
             if v[0] != 'vec':
                 raise TypeError('linkir: cumsum expects a vector')
             out, acc = [], None
@@ -542,6 +968,8 @@ class Builder:
             return ('vec', out)
         if op == 'diff':
             v = self.lower_any(args[0])
+            if v[0] == 'symvec':
+                return ('symvec', v[1], _sdiff(v[2]))
             if v[0] != 'vec':
                 raise TypeError('linkir: diff expects a vector')
             if not v[1]:
@@ -571,6 +999,10 @@ class Builder:
         if isinstance(e, (int, float)):
             return 'scalar'
         if isinstance(e, str):
+            if e in self.sym:
+                return 'vec'
+            if e in self.syms:
+                return 'mat'
             s = self.shapes.get(e)
             return s[0] if s else 'scalar'
         if not isinstance(e, list) or not e:
@@ -606,6 +1038,14 @@ class Builder:
             t, f = self.lower_any(args[1]), self.lower_any(args[2])
             if t[0] == 'scalar' and f[0] == 'scalar':
                 return ('scalar', self.lower(whole))
+            if t[0] == 'symvec':
+                t = self.materialize_symvec(t[1], t[2])
+            if f[0] == 'symvec':
+                f = self.materialize_symvec(f[1], f[2])
+            if t[0] == 'symmat':
+                t = self._materialize_symmat(t)
+            if f[0] == 'symmat':
+                f = self._materialize_symmat(f)
             if t[0] != f[0]:
                 raise TypeError('linkir: if branches have different kinds')
             if t[0] == 'vec':
@@ -619,6 +1059,8 @@ class Builder:
         vals = [self.lower_any(a) for a in args]
         if all(v[0] == 'scalar' for v in vals):
             return ('scalar', self.lower(whole))
+        if any(v[0] in ('symvec', 'symmat') for v in vals):
+            return self._ew_sym(op, vals)
         if op == 'neg' or (op == '-' and len(args) == 1):
             v = vals[0]
             if v[0] == 'vec':
@@ -638,6 +1080,134 @@ class Builder:
         for v in vals[1:]:
             acc = self._ew_bin(kind, acc, v)
         return acc
+
+    def _const_frac(self, v):
+        if v[0] == 'scalar' and self.is_const(v[1]):
+            return _frac_of_float(self.const_val[v[1]])
+        return None
+
+    @staticmethod
+    def _sv_const_value(sv):
+        """The single value of a constant symbolic vector, else None."""
+        poly, ov, shift = _sfold(sv)
+        if _pdeg(poly) > 0:
+            return None
+        c = poly[0] if poly else Fraction(0)
+        if all(v == c for v in ov.values()):
+            return c
+        return None
+
+    def _ew_sym(self, op, vals):
+        """Elementwise ops involving symbolic values. The pure
+        symbolic world (index polynomials, rank-1 factors, constant
+        scalars) is closed and uncapped; anything leaving it
+        materialises (cap applies) or raises."""
+        if op == 'neg' or (op == '-' and len(vals) == 1):
+            v = vals[0]
+            if v[0] == 'symvec':
+                return ('symvec', v[1], _sscale(v[2], Fraction(-1)))
+            return ('symmat', v[1], v[2], -v[3])
+        if op in FN1:
+            v = vals[0]
+            if v[0] == 'symvec':
+                mv = self.materialize_symvec(v[1], v[2])
+                return ('vec', [self.mk_fn(op, el) for el in mv[1]])
+            raise TypeError(f'linkir: {op} on a symbolic matrix')
+        kind = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div'}[op]
+        acc = vals[0]
+        for v in vals[1:]:
+            acc = self._ew_sym_bin(kind, acc, v)
+        return acc
+
+    def _ew_sym_bin(self, kind, a, b):
+        ka, kb = a[0], b[0]
+        # convert all-constant unrolled vectors to symbolic form
+        if ka == 'vec' and kb in ('symvec', 'symmat'):
+            f = self._factor_of(a)
+            if f is not None and f[0] == 'vals':
+                a = ('symvec', len(f[1]), _svals(f[1]))
+                ka = 'symvec'
+        if kb == 'vec' and ka in ('symvec', 'symmat'):
+            f = self._factor_of(b)
+            if f is not None and f[0] == 'vals':
+                b = ('symvec', len(f[1]), _svals(f[1]))
+                kb = 'symvec'
+        if ka == 'symvec' and kb == 'symvec':
+            if a[1] != b[1]:
+                raise TypeError('linkir: vector length mismatch')
+            if kind == 'add':
+                return ('symvec', a[1], _sadd(a[2], b[2]))
+            if kind == 'sub':
+                return ('symvec', a[1], _ssub(a[2], b[2]))
+            if kind == 'mul':
+                return ('symvec', a[1], _smul(a[2], b[2]))
+            c = self._sv_const_value(b[2])
+            if c is None or c == 0:
+                raise TypeError('linkir: symbolic division needs a '
+                                'constant nonzero divisor vector')
+            return ('symvec', a[1], _sscale(a[2], 1 / c))
+        if ka == 'symvec' and kb == 'scalar':
+            c = self._const_frac(b)
+            if c is None or (kind == 'div' and c == 0):
+                mv = self.materialize_symvec(a[1], a[2])
+                return ('vec', [self.mk_bin(kind, el, b[1])
+                                for el in mv[1]])
+            return self._sym_scalar(kind, a, c, rev=False)
+        if ka == 'scalar' and kb == 'symvec':
+            c = self._const_frac(a)
+            if c is None:
+                mv = self.materialize_symvec(b[1], b[2])
+                rk = {'add': 'add', 'mul': 'mul',
+                      'sub': 'rsub', 'div': 'rdiv'}[kind]
+                return ('vec', [self.mk_bin(rk, el, a[1])
+                                for el in mv[1]])
+            return self._sym_scalar(kind, b, c, rev=True)
+        if ka == 'symvec' and kb == 'vec':
+            mv = self.materialize_symvec(a[1], a[2])
+            return self._ew_bin(kind, mv, b)
+        if ka == 'vec' and kb == 'symvec':
+            mv = self.materialize_symvec(b[1], b[2])
+            return self._ew_bin(kind, a, mv)
+        if ka == 'symmat' and kb == 'scalar':
+            c = self._const_frac(b)
+            if kind == 'mul' and c is not None:
+                return ('symmat', a[1], a[2], a[3] * c)
+            if kind == 'div' and c is not None and c != 0:
+                return ('symmat', a[1], a[2], a[3] / c)
+            return self._ew_bin(kind, self._materialize_symmat(a), b)
+        if ka == 'scalar' and kb == 'symmat':
+            c = self._const_frac(a)
+            if kind == 'mul' and c is not None:
+                return ('symmat', b[1], b[2], b[3] * c)
+            return self._ew_bin(kind, a, self._materialize_symmat(b))
+        if ka in ('symmat', 'mat') and kb in ('symmat', 'mat'):
+            ma = self._materialize_symmat(a) if ka == 'symmat' else a
+            mb = self._materialize_symmat(b) if kb == 'symmat' else b
+            return self._ew_bin(kind, ma, mb)
+        raise TypeError(f'linkir: unsupported operand kinds for {kind}: '
+                        f'{ka} and {kb}')
+
+    def _sym_scalar(self, kind, v, c, rev):
+        """symvec combined with a constant scalar c (rev: scalar was
+        the left operand)."""
+        sv = v[2]
+        if kind == 'add':
+            return ('symvec', v[1], _sadd_const(sv, c))
+        if kind == 'sub':
+            if rev:
+                return ('symvec', v[1],
+                        _sadd_const(_sscale(sv, Fraction(-1)), c))
+            return ('symvec', v[1], _sadd_const(sv, -c))
+        if kind == 'mul':
+            return ('symvec', v[1], _sscale(sv, c))
+        # div
+        if rev:
+            d = self._sv_const_value(sv)
+            if d is None or d == 0:
+                raise TypeError('linkir: scalar / symbolic vector needs '
+                                'a constant nonzero divisor vector')
+            return ('symvec', v[1], ([c / d], {}, Fraction(0)))
+        return ('symvec', v[1], _sscale(sv, 1 / c))
 
     def _ew_bin(self, kind, a, b):
         ka, kb = a[0], b[0]
@@ -692,10 +1262,13 @@ class Lower:
         self.integer = integer
         self.cert_sink = cert_sink
         self.shapes = {}         # name -> ('vec', n) | ('mat', (r, c))
+        self.sym = {}            # name -> (n, symvec)
+        self.syms = {}           # name -> symmat value
 
     def _builder(self):
         return Builder(mode=self.mode, integer=self.integer,
-                       cert_sink=self.cert_sink, shapes=self.shapes)
+                       cert_sink=self.cert_sink, shapes=self.shapes,
+                       sym=self.sym, syms=self.syms)
 
     def expr(self, e):
         b = self._builder()
@@ -713,19 +1286,47 @@ class Lower:
             name = node[1]
             if v[0] == 'scalar':
                 self.shapes.pop(name, None)
+                self.sym.pop(name, None)
+                self.syms.pop(name, None)
                 return (op, name, b.finish(v[1]))
+            if v[0] == 'symvec':
+                # a symbolic binding costs no IR at all
+                self.sym[name] = (v[1], v[2])
+                self.syms.pop(name, None)
+                self.shapes.pop(name, None)
+                return ('block', [])
+            if v[0] == 'symmat':
+                self.syms[name] = v
+                self.sym.pop(name, None)
+                self.shapes.pop(name, None)
+                return ('block', [])
             if v[0] == 'vec':
                 self.shapes[name] = ('vec', len(v[1]))
+                self.sym.pop(name, None)
+                self.syms.pop(name, None)
                 return ('block', [(op, f'{name}__{i}', b.finish(el))
                                   for i, el in enumerate(v[1])])
             rows = len(v[1])
             cols = len(v[1][0]) if rows else 0
             self.shapes[name] = ('mat', (rows, cols))
+            self.sym.pop(name, None)
+            self.syms.pop(name, None)
             return ('block', [(op, f'{name}__{i}__{j}', b.finish(el))
                               for i, row in enumerate(v[1])
                               for j, el in enumerate(row)])
         if op == 'set-idx':
             name = node[1]
+            if name in self.sym:
+                # set-idx breaks the symbolic form: materialise the
+                # binding into element variables, then set as usual.
+                n, sv = self.sym.pop(name)
+                mb = self._builder()
+                mv = mb.materialize_symvec(n, sv)
+                self.shapes[name] = ('vec', n)
+                parts = [('let', f'{name}__{i}', mb.finish(el))
+                         for i, el in enumerate(mv[1])]
+                parts.append(self.stmt(node))
+                return ('block', parts)
             if self.shapes.get(name, (None,))[0] != 'vec':
                 raise TypeError(f'linkir: set-idx on non-vector {name}')
             ib = self._builder()
@@ -746,6 +1347,17 @@ class Lower:
                 b, v = self.expr_any(a)
                 if v[0] == 'scalar':
                     parts.append(('expr', b.finish(v[1])))
+                elif v[0] == 'symvec':
+                    poly, ov, shift = v[2]
+                    parts.append(('symvec', (v[1],
+                                             tuple(float(c) for c in poly),
+                                             {i: float(x)
+                                              for i, x in ov.items()},
+                                             float(shift))))
+                elif v[0] == 'symmat':
+                    parts.append(('symmat', (b._fdesc(v[1]),
+                                             b._fdesc(v[2]),
+                                             float(v[3]))))
                 elif v[0] == 'vec':
                     parts.append(('vec', [b.finish(el) for el in v[1]]))
                 else:
@@ -852,6 +1464,23 @@ class Interp:
         return str(int(v)) if float(v) == int(v) and abs(v) < 1e16 else repr(v)
 
     @staticmethod
+    def _factor_vals(desc):
+        """Element values of a symbolic factor, for printing."""
+        if desc[0] == 'vals':
+            return list(desc[1])
+        _, n, poly, ov, shift = desc
+        out = []
+        for i in range(n):
+            if i in ov:
+                out.append(ov[i])
+            else:
+                acc = 0.0
+                for c in reversed(poly):
+                    acc = acc * i + c
+                out.append(acc + shift)
+        return out
+
+    @staticmethod
     def fmt_debug(v):
         """Rust {:?} for f64 (vector/matrix elements): shortest
         round-trip, always with a decimal point."""
@@ -887,6 +1516,27 @@ class Interp:
                 elif tag == 'vec':
                     line.append('[' + ', '.join(
                         self.fmt_debug(self.eval(e)) for e in payload) + ']')
+                elif tag == 'symvec':
+                    n, poly, ov, shift = payload
+                    vals = []
+                    for i in range(n):
+                        if i in ov:
+                            vals.append(ov[i])
+                        else:
+                            acc = 0.0
+                            for c in reversed(poly):
+                                acc = acc * i + c
+                            vals.append(acc + shift)
+                    line.append('[' + ', '.join(
+                        self.fmt_debug(x) for x in vals) + ']')
+                elif tag == 'symmat':
+                    fa, fb, coef = payload
+                    rows = self._factor_vals(fa)
+                    cols = self._factor_vals(fb)
+                    line.append('[' + ', '.join(
+                        '[' + ', '.join(
+                            self.fmt_debug(coef * x * y) for y in cols)
+                        + ']' for x in rows) + ']')
                 elif tag == 'mat':
                     line.append('[' + ', '.join(
                         '[' + ', '.join(
@@ -955,6 +1605,11 @@ def dump(stmts, indent=''):
                 elif tag == 'vec':
                     for e in payload:
                         lines += dump_expr(e, indent + '  ')
+                elif tag == 'symvec':
+                    lines.append(f'{indent}  symvec n={payload[0]} '
+                                 f'(symbolic, {len(payload[1])} coeffs)')
+                elif tag == 'symmat':
+                    lines.append(f'{indent}  symmat (rank-1 symbolic)')
                 else:
                     for row in payload:
                         for e in row:

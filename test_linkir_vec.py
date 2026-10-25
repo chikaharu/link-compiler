@@ -92,12 +92,10 @@ data = {'version': 1, 'expressions': json.loads(json.dumps(sink))}
 ok, reason = check_cert_data(data)
 expect(ok, f'demo.link boundary certificate valid ({reason})')
 
-# the unroll cap is a clear error, not a hang (bench.link's 1e6 iota)
-try:
-    run_src('(program (print (len (iota 1000000.0))))')
-    expect(False, 'iota 1e6 raises the unroll cap error')
-except TypeError as ex:
-    expect('unroll limit' in str(ex), f'iota 1e6 raises the unroll cap error ({ex})')
+# since v0.11, iota & friends are symbolic: no unroll cap (see
+# test_linkir_sym.py). A huge len is a compile-time constant.
+out = run_src('(program (print (len (iota 1000000.0))))')
+expect(out == '1000000\n', f'iota 1e6 len works symbolically: {out.strip()!r}')
 
 # dynamic set-idx index is a clear error
 try:
