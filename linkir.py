@@ -49,6 +49,12 @@ from boundary import extract as boundary_extract, reconstruct as boundary_recons
 FN1 = {'sqrt': math.sqrt, 'exp': math.exp, 'log': math.log,
        'abs': abs, 'sin': math.sin, 'cos': math.cos}
 
+# Vectors and matrices are decomposed into 1x1 Links by unrolling, so a
+# compile-time-known size is required. The cap keeps the decomposition
+# a decomposition (bulk pipelines of 1e6 elements belong to linkc's
+# native Vec code, not to an unrolled IR).
+MAX_UNROLL = 100_000
+
 def gc_nodes(nodes, result):
     """Drop unreachable nodes, renumber. Returns (nodes, result)."""
     keep, stack = set(), [result]
@@ -275,12 +281,17 @@ class Builder:
                         inverse pairs are cancelled afterwards at their seams
           'interval' -- additionally, affine chains are composed (interval reduction)
     """
-    def __init__(self, mode='interval', integer=False, cert_sink=None):
+    def __init__(self, mode='interval', integer=False, cert_sink=None,
+                 shapes=None):
         self.nodes = []          # dicts: kind, x, s, p, q, name
         self.const_val = {}      # node id -> float, when known constant
         self.norm = {}           # node id -> (base_id, p, q): value = p*base + q
         self.mode = mode
         self.cert_sink = cert_sink
+        # shapes: name -> ('vec', n) | ('mat', (r, c)) for variables
+        # bound to vectors/matrices; shared across a whole program so
+        # later statements can materialise element variables (name__i).
+        self.shapes = shapes if shapes is not None else {}
         self.reduce = (mode != 'none')
         # integer=True: target is linkbin's integer dialect. Constant
         # folding is disabled (floats cannot fold i64 arithmetic exactly),
@@ -361,7 +372,16 @@ class Builder:
         if isinstance(e, Str):
             raise TypeError('string inside expression')
         if isinstance(e, str):
+            if e in self.shapes:
+                raise TypeError(f'linkir: {e} is a {self.shapes[e][0]}, '
+                                'not a scalar')
             return self.add('var', name=e)
+        if isinstance(e, list) and e and e[0] in (
+                'dot', 'norm', 'len', 'idx', 'and', 'or', 'not'):
+            v = self.lower_any(e)
+            if v[0] != 'scalar':
+                raise TypeError(f'linkir: {e[0]} did not produce a scalar')
+            return v[1]
         op, args = e[0], e[1:]
         if op == 'read-int':
             return self.add('read')
@@ -392,6 +412,261 @@ class Builder:
             return self.add('if', x=c, s=(t, f))
         raise TypeError(f'linkir: unknown operator {op}')
 
+    # -------------------------------------------- vectors and matrices
+    # Values: ('scalar', nid) | ('vec', [nid, ...]) |
+    #         ('mat', [[nid, ...], ...]). Everything is unrolled into
+    # 1x1 Links: a vector operation is exactly its scalar decomposition.
+
+    def _check_size(self, n):
+        if n > MAX_UNROLL:
+            raise TypeError(
+                f'linkir: {n} elements exceed the 1x1 unroll limit '
+                f'({MAX_UNROLL}); use linkc for bulk vectors')
+
+    def _static_size(self, e):
+        nid = self.lower(e)
+        if not self.is_const(nid):
+            raise TypeError('linkir: vector size must be a compile-time '
+                            'constant (unrolled decomposition)')
+        n = int(self.const_val[nid])
+        if n < 0:
+            raise TypeError('linkir: negative vector size')
+        self._check_size(n)
+        return n
+
+    def _dot(self, a, b):
+        acc = None
+        for x, y in zip(a, b):
+            p = self.mk_bin('mul', x, y)
+            acc = p if acc is None else self.mk_bin('add', acc, p)
+        return acc if acc is not None else self.const(0.0)
+
+    def lower_any(self, e):
+        if isinstance(e, str) and e in self.shapes:
+            kind, shape = self.shapes[e]
+            if kind == 'vec':
+                return ('vec', [self.add('var', name=f'{e}__{i}')
+                                for i in range(shape)])
+            r, c = shape
+            return ('mat', [[self.add('var', name=f'{e}__{i}__{j}')
+                             for j in range(c)] for i in range(r)])
+        if not isinstance(e, list) or not e:
+            return ('scalar', self.lower(e))
+        op, args = e[0], e[1:]
+        if op == 'vec':
+            elems = []
+            for a in args:
+                v = self.lower_any(a)
+                if v[0] != 'scalar':
+                    raise TypeError('linkir: vec elements must be scalars')
+                elems.append(v[1])
+            self._check_size(len(elems))
+            return ('vec', elems)
+        if op in ('zeros', 'ones', 'iota'):
+            n = self._static_size(args[0])
+            return ('vec', [self.const(float(i) if op == 'iota'
+                                        else (0.0 if op == 'zeros' else 1.0))
+                            for i in range(n)])
+        if op == 'len':
+            v = self.lower_any(args[0])
+            if v[0] == 'scalar':
+                raise TypeError('linkir: len of a scalar')
+            return ('scalar', self.const(float(len(v[1]))))
+        if op == 'idx':
+            v = self.lower_any(args[0])
+            if v[0] != 'vec':
+                raise TypeError('linkir: idx expects a vector')
+            elems = v[1]
+            iv = self.lower(args[1])
+            if self.is_const(iv):
+                i = int(self.const_val[iv])
+                if not (0 <= i < len(elems)):
+                    raise TypeError(f'linkir: idx {i} out of range')
+                return ('scalar', elems[i])
+            acc = elems[-1]
+            for i in range(len(elems) - 2, -1, -1):
+                c = self.add('cmp', x=iv, s=self.const(float(i)), name='==')
+                acc = self.add('if', x=c, s=(elems[i], acc))
+            return ('scalar', acc)
+        if op == 'dot':
+            a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            if a[0] != 'vec' or b[0] != 'vec' or len(a[1]) != len(b[1]):
+                raise TypeError('linkir: dot expects two vectors of '
+                                'equal length')
+            return ('scalar', self._dot(a[1], b[1]))
+        if op == 'norm':
+            a = self.lower_any(args[0])
+            if a[0] != 'vec':
+                raise TypeError('linkir: norm expects a vector')
+            return ('scalar', self.mk_fn('sqrt', self._dot(a[1], a[1])))
+        if op == 'outer':
+            a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            if a[0] != 'vec' or b[0] != 'vec':
+                raise TypeError('linkir: outer expects two vectors')
+            self._check_size(len(a[1]) * len(b[1]))
+            return ('mat', [[self.mk_bin('mul', x, y) for y in b[1]]
+                            for x in a[1]])
+        if op == 'gram':
+            vs = [self.lower_any(a) for a in args]
+            if any(v[0] != 'vec' for v in vs):
+                raise TypeError('linkir: gram expects vectors')
+            return ('mat', [[self._dot(u[1], w[1]) for w in vs]
+                            for u in vs])
+        if op == 'matvec':
+            m, v = self.lower_any(args[0]), self.lower_any(args[1])
+            if m[0] != 'mat' or v[0] != 'vec' \
+                    or (m[1] and len(m[1][0]) != len(v[1])):
+                raise TypeError('linkir: matvec shape mismatch')
+            return ('vec', [self._dot(row, v[1]) for row in m[1]])
+        if op == 'matmul':
+            a, b = self.lower_any(args[0]), self.lower_any(args[1])
+            if a[0] != 'mat' or b[0] != 'mat' \
+                    or (a[1] and len(a[1][0]) != len(b[1])):
+                raise TypeError('linkir: matmul shape mismatch')
+            cols = [list(col) for col in zip(*b[1])]
+            return ('mat', [[self._dot(row, col) for col in cols]
+                            for row in a[1]])
+        if op == 'transpose':
+            m = self.lower_any(args[0])
+            if m[0] != 'mat':
+                raise TypeError('linkir: transpose expects a matrix')
+            return ('mat', [list(row) for row in zip(*m[1])])
+        if op == 'cumsum':
+            v = self.lower_any(args[0])
+            if v[0] != 'vec':
+                raise TypeError('linkir: cumsum expects a vector')
+            out, acc = [], None
+            for el in v[1]:
+                acc = el if acc is None else self.mk_bin('add', acc, el)
+                out.append(acc)
+            return ('vec', out)
+        if op == 'diff':
+            v = self.lower_any(args[0])
+            if v[0] != 'vec':
+                raise TypeError('linkir: diff expects a vector')
+            if not v[1]:
+                return ('vec', [])
+            out = [v[1][0]]
+            for i in range(1, len(v[1])):
+                out.append(self.mk_bin('sub', v[1][i], v[1][i - 1]))
+            return ('vec', out)
+        if op in ('and', 'or', 'not'):
+            if op == 'not':
+                return ('scalar', self.mk_aff(self.lower(args[0]),
+                                              -1.0, 1.0))
+            a, b = self.lower(args[0]), self.lower(args[1])
+            if op == 'and':
+                return ('scalar', self.mk_bin('mul', a, b))
+            t = self.mk_bin('add', a, b)
+            return ('scalar', self.add('cmp', x=t, s=self.const(0.0),
+                                       name='>'))
+        if op in ('+', '-', '*', '/') or op == 'neg' or op in FN1 \
+                or op == 'if':
+            return self._ew(op, args, e)
+        return ('scalar', self.lower(e))
+
+    def _kind_of(self, e):
+        """Infer scalar/vec/mat WITHOUT lowering (linkc's infer, so
+        the scalar path is chosen before any node is built)."""
+        if isinstance(e, (int, float)):
+            return 'scalar'
+        if isinstance(e, str):
+            s = self.shapes.get(e)
+            return s[0] if s else 'scalar'
+        if not isinstance(e, list) or not e:
+            return 'scalar'
+        op = e[0]
+        if op in ('vec', 'zeros', 'ones', 'iota', 'cumsum', 'diff',
+                  'matvec'):
+            return 'vec'
+        if op in ('outer', 'gram', 'matmul', 'transpose'):
+            return 'mat'
+        if op in ('+', '-', '*', '/'):
+            ks = [self._kind_of(a) for a in e[1:]]
+            if 'mat' in ks:
+                return 'mat'
+            if 'vec' in ks:
+                return 'vec'
+            return 'scalar'
+        if op == 'neg' or op in FN1:
+            return self._kind_of(e[1])
+        if op == 'if':
+            return self._kind_of(e[2])
+        return 'scalar'
+
+    def _ew(self, op, args, whole):
+        """Elementwise-capable operators: scalar operands keep the
+        classic scalar path (identical nodes to before); any vector or
+        matrix operand switches the whole operation to its unrolled
+        elementwise decomposition."""
+        if self._kind_of(whole) == 'scalar':
+            return ('scalar', self.lower(whole))
+        if op == 'if':
+            c = self.lower(args[0])
+            t, f = self.lower_any(args[1]), self.lower_any(args[2])
+            if t[0] == 'scalar' and f[0] == 'scalar':
+                return ('scalar', self.lower(whole))
+            if t[0] != f[0]:
+                raise TypeError('linkir: if branches have different kinds')
+            if t[0] == 'vec':
+                if len(t[1]) != len(f[1]):
+                    raise TypeError('linkir: if branch length mismatch')
+                return ('vec', [self.add('if', x=c, s=(x, y))
+                                for x, y in zip(t[1], f[1])])
+            return ('mat', [[self.add('if', x=c, s=(x, y))
+                             for x, y in zip(ra, rb)]
+                            for ra, rb in zip(t[1], f[1])])
+        vals = [self.lower_any(a) for a in args]
+        if all(v[0] == 'scalar' for v in vals):
+            return ('scalar', self.lower(whole))
+        if op == 'neg' or (op == '-' and len(args) == 1):
+            v = vals[0]
+            if v[0] == 'vec':
+                return ('vec', [self.mk_aff(el, -1.0, 0.0) for el in v[1]])
+            return ('mat', [[self.mk_aff(el, -1.0, 0.0) for el in row]
+                            for row in v[1]])
+        if op in FN1:
+            v = vals[0]
+            if v[0] == 'vec':
+                return ('vec', [self.mk_fn(op, el) for el in v[1]])
+            if v[0] == 'mat':
+                return ('mat', [[self.mk_fn(op, el) for el in row]
+                                for row in v[1]])
+            return ('scalar', self.lower(whole))
+        kind = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div'}[op]
+        acc = vals[0]
+        for v in vals[1:]:
+            acc = self._ew_bin(kind, acc, v)
+        return acc
+
+    def _ew_bin(self, kind, a, b):
+        ka, kb = a[0], b[0]
+        if ka == 'scalar' and kb == 'scalar':
+            return ('scalar', self.mk_bin(kind, a[1], b[1]))
+        if ka == 'vec' and kb == 'vec':
+            if len(a[1]) != len(b[1]):
+                raise TypeError('linkir: vector length mismatch')
+            return ('vec', [self.mk_bin(kind, x, y)
+                            for x, y in zip(a[1], b[1])])
+        if ka == 'vec' and kb == 'scalar':
+            return ('vec', [self.mk_bin(kind, x, b[1]) for x in a[1]])
+        if ka == 'scalar' and kb == 'vec':
+            rk = {'add': 'add', 'mul': 'mul',
+                  'sub': 'rsub', 'div': 'rdiv'}[kind]
+            return ('vec', [self.mk_bin(rk, y, a[1]) for y in b[1]])
+        if ka == 'mat' and kb == 'mat' and kind == 'add':
+            return ('mat', [[self.mk_bin('add', x, y)
+                             for x, y in zip(ra, rb)]
+                            for ra, rb in zip(a[1], b[1])])
+        if ka == 'mat' and kb == 'scalar' and kind == 'mul':
+            return ('mat', [[self.mk_bin('mul', x, b[1]) for x in row]
+                            for row in a[1]])
+        if ka == 'scalar' and kb == 'mat' and kind == 'mul':
+            return ('mat', [[self.mk_bin('mul', x, a[1]) for x in row]
+                            for row in b[1]])
+        raise TypeError(f'linkir: unsupported operand kinds for {kind}: '
+                        f'{ka} and {kb}')
+
     def finish(self, result):
         """Boundary pass if requested, then drop dead links and renumber."""
         if self.mode == 'boundary':
@@ -416,21 +691,66 @@ class Lower:
         self.mode = mode
         self.integer = integer
         self.cert_sink = cert_sink
+        self.shapes = {}         # name -> ('vec', n) | ('mat', (r, c))
+
+    def _builder(self):
+        return Builder(mode=self.mode, integer=self.integer,
+                       cert_sink=self.cert_sink, shapes=self.shapes)
 
     def expr(self, e):
-        b = Builder(mode=self.mode, integer=self.integer,
-                    cert_sink=self.cert_sink)
+        b = self._builder()
         result = b.lower(e)
         return b.finish(result)
+
+    def expr_any(self, e):
+        b = self._builder()
+        return b, b.lower_any(e)
 
     def stmt(self, node):
         op = node[0] if isinstance(node, list) and node else None
         if op in ('let', 'set'):
-            return (op, node[1], self.expr(node[2]))
+            b, v = self.expr_any(node[2])
+            name = node[1]
+            if v[0] == 'scalar':
+                self.shapes.pop(name, None)
+                return (op, name, b.finish(v[1]))
+            if v[0] == 'vec':
+                self.shapes[name] = ('vec', len(v[1]))
+                return ('block', [(op, f'{name}__{i}', b.finish(el))
+                                  for i, el in enumerate(v[1])])
+            rows = len(v[1])
+            cols = len(v[1][0]) if rows else 0
+            self.shapes[name] = ('mat', (rows, cols))
+            return ('block', [(op, f'{name}__{i}__{j}', b.finish(el))
+                              for i, row in enumerate(v[1])
+                              for j, el in enumerate(row)])
+        if op == 'set-idx':
+            name = node[1]
+            if self.shapes.get(name, (None,))[0] != 'vec':
+                raise TypeError(f'linkir: set-idx on non-vector {name}')
+            ib = self._builder()
+            iv = ib.lower(node[2])
+            if not ib.is_const(iv):
+                raise TypeError('linkir: set-idx index must be a '
+                                'compile-time constant')
+            i = int(ib.const_val[iv])
+            if not (0 <= i < self.shapes[name][1]):
+                raise TypeError('linkir: set-idx index out of range')
+            return ('set', f'{name}__{i}', self.expr(node[3]))
         if op == 'print':
             parts = []
             for a in node[1:]:
-                parts.append(('str', str(a)) if isinstance(a, Str) else ('expr', self.expr(a)))
+                if isinstance(a, Str):
+                    parts.append(('str', str(a)))
+                    continue
+                b, v = self.expr_any(a)
+                if v[0] == 'scalar':
+                    parts.append(('expr', b.finish(v[1])))
+                elif v[0] == 'vec':
+                    parts.append(('vec', [b.finish(el) for el in v[1]]))
+                else:
+                    parts.append(('mat', [[b.finish(el) for el in row]
+                                          for row in v[1]]))
             return ('print', parts)
         if op == 'for':
             if len(node) >= 5 and not isinstance(node[3], list):
@@ -457,7 +777,13 @@ def count_nodes(ir_stmts):
         if k in ('let', 'set'):
             n += len(st[2][0])
         elif k == 'print':
-            n += sum(len(p[1][0]) for p in st[1] if p[0] == 'expr')
+            for p in st[1]:
+                if p[0] == 'expr':
+                    n += len(p[1][0])
+                elif p[0] == 'vec':
+                    n += sum(len(e[0]) for e in p[1])
+                elif p[0] == 'mat':
+                    n += sum(len(e[0]) for row in p[1] for e in row)
         elif k == 'for':
             n += (len(st[2][0]) if st[2] else 0) + len(st[3][0]) + count_nodes(st[4])
         elif k == 'while':
@@ -525,6 +851,20 @@ class Interp:
             return repr(v)
         return str(int(v)) if float(v) == int(v) and abs(v) < 1e16 else repr(v)
 
+    @staticmethod
+    def fmt_debug(v):
+        """Rust {:?} for f64 (vector/matrix elements): shortest
+        round-trip, always with a decimal point."""
+        if v != v:
+            return 'NaN'
+        if v in (float('inf'), float('-inf')):
+            return 'inf' if v > 0 else '-inf'
+        if v == 0.0:
+            return '-0.0' if math.copysign(1.0, v) < 0 else '0.0'
+        if float(v) == int(v) and abs(v) < 1e16:
+            return f'{int(v)}.0'
+        return repr(v)
+
     def run(self, stmts):
         for st in stmts:
             self.stmt(st)
@@ -540,7 +880,18 @@ class Interp:
         elif k == 'print':
             line = []
             for tag, payload in st[1]:
-                line.append(payload if tag == 'str' else self.fmt(self.eval(payload)))
+                if tag == 'str':
+                    line.append(payload)
+                elif tag == 'expr':
+                    line.append(self.fmt(self.eval(payload)))
+                elif tag == 'vec':
+                    line.append('[' + ', '.join(
+                        self.fmt_debug(self.eval(e)) for e in payload) + ']')
+                elif tag == 'mat':
+                    line.append('[' + ', '.join(
+                        '[' + ', '.join(
+                            self.fmt_debug(self.eval(e)) for e in row) + ']'
+                        for row in payload) + ']')
             self.out.append(' '.join(line) + '\n')
         elif k == 'for':
             _, var, lo, hi, body = st
@@ -599,8 +950,15 @@ def dump(stmts, indent=''):
             for tag, payload in st[1]:
                 if tag == 'str':
                     lines.append(f'{indent}  str {payload!r}')
-                else:
+                elif tag == 'expr':
                     lines += dump_expr(payload, indent + '  ')
+                elif tag == 'vec':
+                    for e in payload:
+                        lines += dump_expr(e, indent + '  ')
+                else:
+                    for row in payload:
+                        for e in row:
+                            lines += dump_expr(e, indent + '  ')
         elif k == 'for':
             lines.append(f'{indent}for {st[1]}:')
             lines += dump(st[4], indent + '  ')
