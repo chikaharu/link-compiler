@@ -18,12 +18,22 @@ BEFORE running anything,
 and predicts one of:
 
   TRANSPARENT   no observable output can change (delta == 0, a dead
-                write, or every consumer's gain is exactly 0)
+                write, or every consumer's change polynomial is 0)
   DESTRUCTIVE   some observable provably changes; the exact change
-                Delta = gain * delta is predicted for linear
-                (scalar) observables
-  UNKNOWN       the analysis abstains (dynamic indices, nonlinear
-                or unmodelled consumers, unknown written values)
+                is predicted (see below)
+  UNKNOWN       the analysis abstains (dynamic indices, unmodelled
+                consumers, unknown written values)
+
+v0.14 (Taylor x Cayley-Hamilton, experiment #42): scalar observables
+are no longer linearised. Each observable's change is computed as an
+exact delta-polynomial (the terminating Taylor expansion of a
+polynomial consumer): products and powers of linear observables --
+whose delta^2 cross terms v0.13 had to abstain on -- now resolve
+exactly, dot consumers expand to degree 2 (<P1,S2> + <S1,P2> linear
+part, <P1,P2> quadratic part), norm consumers are decided exactly
+through Delta(||E||^2) (a sign flip of one element, delta = -2*v[i],
+provably preserves the norm), and a top-level analytic consumer
+f(polynomial) is decided at a known delta by direct evaluation.
 
 The predictor is sound by construction: it never claims TRANSPARENT
 or DESTRUCTIVE without a proof inside its model. test_linkpredict.py
@@ -32,6 +42,7 @@ with and without the write) on hand cases and a randomised battery.
 
 Usage: python3 linkpredict.py program.link
 """
+import math
 import sys
 from fractions import Fraction
 
@@ -42,6 +53,49 @@ from linkir import (Builder, FN1, _selem, _sadd, _ssub, _sscale,
 
 ZERO_SV = ([Fraction(0)], {}, Fraction(0))
 DEPENDS = 'depends'
+DEG_CAP = 8           # highest delta-polynomial degree kept exact
+
+
+# delta-polynomials: the change of a scalar observable as an exact
+# polynomial in the injected residue delta (the terminating Taylor
+# expansion of a polynomial consumer). Represented as coefficient
+# lists with a zero constant term; [] is the zero polynomial.
+def _dp(coeffs):
+    out = list(coeffs)
+    while out and out[-1] == 0:
+        out.pop()
+    return out
+
+
+def _dp_add(a, b):
+    n = max(len(a), len(b))
+    return _dp([(a[i] if i < len(a) else Fraction(0))
+                + (b[i] if i < len(b) else Fraction(0))
+                for i in range(n)])
+
+
+def _dp_scale(a, s):
+    if s == 0:
+        return []
+    return _dp([c * s for c in a])
+
+
+def _dp_mul(a, b):
+    if not a or not b:
+        return []
+    out = [Fraction(0)] * (len(a) + len(b) - 1)
+    for i, x in enumerate(a):
+        if x:
+            for j, y in enumerate(b):
+                out[i + j] += x * y
+    return _dp(out)
+
+
+def _dp_eval(a, x):
+    acc = Fraction(0)
+    for c in reversed(a):
+        acc = acc * x + c
+    return acc
 
 
 def is_zero_sv(sv):
@@ -158,8 +212,7 @@ class SiteScan:
         if op == 'matvec':
             return self._pattern_matvec(args)
         if op == 'if':
-            g = self.scalar_gain(args[0])
-            if g is DEPENDS or (g != 0):
+            if not self.dpoly_is_zero(args[0]):
                 return DEPENDS
             p1, p2 = self.pattern(args[1]), self.pattern(args[2])
             if p1 is DEPENDS or p2 is DEPENDS:
@@ -168,11 +221,12 @@ class SiteScan:
         if op == 'vec':
             ov = {}
             for j, a in enumerate(args):
-                g = self.scalar_gain(a)
-                if g is DEPENDS:
+                dp = self.scalar_dpoly(a)
+                if dp is DEPENDS or isinstance(dp, tuple) \
+                        or len(dp) > 2:
                     return DEPENDS
-                if g != 0:
-                    ov[j] = g
+                if len(dp) > 1 and dp[1] != 0:
+                    ov[j] = dp[1]
             return ([Fraction(0)], ov, Fraction(0))
         if an.mentions(e, self.name, tuple(self.derived_ast)):
             return DEPENDS
@@ -252,16 +306,20 @@ class SiteScan:
                             for t in range(self.n)), Fraction(0)))
         return _svals(out)
 
-    # ------------------------------------------- gain of scalar expr
-    def scalar_gain(self, e):
-        """d(scalar expression)/d delta: a Fraction, or DEPENDS."""
+    # ------------------------------ scalar observables as delta-polys
+    # A scalar observable's change is an exact polynomial in the
+    # residue delta (the terminating Taylor expansion for polynomial
+    # consumers). NORM is a marker triple ('#norm', base2, dpoly2):
+    # the change of ||E||^2 is a delta-polynomial too, and the norm
+    # itself is then decided exactly at evaluation time.
+    def scalar_dpoly(self, e):
         an = self.an
         if isinstance(e, (int, float)):
-            return Fraction(0)
+            return []
         if isinstance(e, str):
-            return self.aux_scalar.get(e, Fraction(0))
+            return self.aux_scalar.get(e, [])
         if not isinstance(e, list) or not e:
-            return Fraction(0)
+            return []
         op, args = e[0], e[1:]
         if op == 'idx':
             tgt = args[0]
@@ -269,98 +327,211 @@ class SiteScan:
                                     tuple(self.derived_ast)) or \
                 (isinstance(tgt, str) and tgt in self.aux_pat)
             if not affected:
-                return Fraction(0)
+                return []
             j = an.const_value(args[1])
             p = self.pattern(tgt)
             if p is DEPENDS:
                 return DEPENDS
             if j is None:
-                return Fraction(0) if is_zero_sv(p) else DEPENDS
-            return _selem(p, int(j))
+                return [] if is_zero_sv(p) else DEPENDS
+            g = _selem(p, int(j))
+            return [Fraction(0), g] if g != 0 else []
         if op == 'dot':
-            a, b_ = args
-            for vec_e, w_e in ((a, b_), (b_, a)):
-                if an.mentions(vec_e, self.name,
-                               tuple(self.derived_ast)) \
-                        or (isinstance(vec_e, str)
-                            and vec_e in self.aux_pat) \
-                        or (isinstance(vec_e, str)
-                            and vec_e in self.derived_ast):
-                    p = self.pattern(vec_e)
-                    if p is DEPENDS:
-                        return DEPENDS
-                    w = an.factor_sv(w_e)
-                    if w is None:
-                        return DEPENDS
-                    return _sdot(p, w, self.n)
-            return Fraction(0)
+            return self._dot_dpoly(args)
         if op == 'norm':
-            if not an.mentions(args[0], self.name,
-                               tuple(self.derived_ast)):
-                return Fraction(0)
-            p = self.pattern(args[0])
-            if p is DEPENDS:
-                return DEPENDS
-            return Fraction(0) if is_zero_sv(p) else DEPENDS
+            return self._norm_marker(args[0])
         if op == 'len':
-            return Fraction(0)
-        if op in ('+', '-', '*', '/'):
-            gains = [self.scalar_gain(a) for a in args]
-            if any(g is DEPENDS for g in gains):
-                return DEPENDS
-            if all(g == 0 for g in gains):
-                return Fraction(0)
-            if op in ('+', '-'):
-                acc = gains[0]
-                for g in gains[1:]:
-                    acc = acc + g if op == '+' else acc - g
-                return acc
+            return []
+        if op in ('+', '-'):
+            acc = self.scalar_dpoly(args[0])
+            if acc is DEPENDS or (isinstance(acc, tuple)):
+                return DEPENDS if acc is DEPENDS else DEPENDS
+            for a in args[1:]:
+                p = self.scalar_dpoly(a)
+                if p is DEPENDS or isinstance(p, tuple):
+                    return DEPENDS
+                acc = _dp_add(acc, p) if op == '+' \
+                    else _dp_add(acc, _dp_scale(p, Fraction(-1)))
+            return acc
+        if op == '*':
             if len(args) != 2:
                 return DEPENDS
-            vals = [an.const_value(a) for a in args]
-            g1, g2 = gains
-            if op == '*':
-                if g1 != 0 and g2 != 0:
-                    return DEPENDS     # delta^2 cross term
-                if g1 != 0 and vals[1] is None:
-                    return DEPENDS
-                if g2 != 0 and vals[0] is None:
-                    return DEPENDS
-                return g1 * (vals[1] or Fraction(0)) \
-                    + g2 * (vals[0] or Fraction(0))
-            # '/': a moving denominator makes the change nonlinear
-            va, vb = vals
-            if g2 != 0:
+            A = self.scalar_dpoly(args[0])
+            B = self.scalar_dpoly(args[1])
+            if A is DEPENDS or B is DEPENDS \
+                    or isinstance(A, tuple) or isinstance(B, tuple):
                 return DEPENDS
+            if not A and not B:
+                return []
+            b1 = self.scalar_base(args[0]) if B else Fraction(0)
+            b2 = self.scalar_base(args[1]) if A else Fraction(0)
+            if (B and b1 is None) or (A and b2 is None):
+                return DEPENDS
+            out = _dp_add(_dp_scale(B, b1 or Fraction(0)),
+                          _dp_scale(A, b2 or Fraction(0)))
+            out = _dp_add(out, _dp_mul(A, B))
+            if len(out) - 1 > DEG_CAP:
+                return DEPENDS
+            return out
+        if op == '/':
+            if len(args) != 2:
+                return DEPENDS
+            A = self.scalar_dpoly(args[0])
+            B = self.scalar_dpoly(args[1])
+            if A is DEPENDS or B is DEPENDS \
+                    or isinstance(A, tuple) or isinstance(B, tuple):
+                return DEPENDS
+            if B:
+                return DEPENDS       # moving denominator: not a poly
+            vb = self.scalar_base(args[1])
             if vb is None or vb == 0:
                 return DEPENDS
-            return g1 / vb
+            return _dp_scale(A, 1 / vb)
         if op == 'neg':
-            g = self.scalar_gain(args[0])
-            return DEPENDS if g is DEPENDS else -g
+            p = self.scalar_dpoly(args[0])
+            if p is DEPENDS or isinstance(p, tuple):
+                return DEPENDS
+            return _dp_scale(p, Fraction(-1))
         if op in FN1:
-            g = self.scalar_gain(args[0])
-            if g is DEPENDS:
+            p = self.scalar_dpoly(args[0])
+            if p is DEPENDS or isinstance(p, tuple):
                 return DEPENDS
-            return Fraction(0) if g == 0 else DEPENDS
+            return [] if not p else DEPENDS
         if op in ('<', '<=', '>', '>=', '==', '!='):
-            gains = [self.scalar_gain(a) for a in args]
-            if any(g is DEPENDS or g != 0 for g in gains):
-                return DEPENDS
-            return Fraction(0)
+            for a in args:
+                p = self.scalar_dpoly(a)
+                if p is DEPENDS or isinstance(p, tuple) or p:
+                    return DEPENDS
+            return []
         if op == 'if':
-            gc = self.scalar_gain(args[0])
-            if gc is DEPENDS or gc != 0:
+            pc = self.scalar_dpoly(args[0])
+            if pc is DEPENDS or isinstance(pc, tuple) or pc:
                 return DEPENDS
-            g1, g2 = self.scalar_gain(args[1]), self.scalar_gain(args[2])
-            if g1 is DEPENDS or g2 is DEPENDS:
+            p1 = self.scalar_dpoly(args[1])
+            p2 = self.scalar_dpoly(args[2])
+            if p1 is DEPENDS or p2 is DEPENDS \
+                    or isinstance(p1, tuple) or isinstance(p2, tuple):
                 return DEPENDS
-            return g1 if g1 == g2 else DEPENDS
+            return p1 if p1 == p2 else DEPENDS
         if op in ('read-int', 'read-eof?'):
-            return Fraction(0)
+            return []
         if an.mentions(e, self.name, tuple(self.derived_ast)):
             return DEPENDS
-        return Fraction(0)
+        return []
+
+    def scalar_base(self, e):
+        """Natural value of a scalar expression, for the product
+        rule: the analyser's const_value, extended structurally to
+        dot products and constant index reads (whose folded values
+        the builder does not register as scalar constants)."""
+        an = self.an
+        v = an.const_value(e)
+        if v is not None:
+            return v
+        if isinstance(e, list) and e:
+            if e[0] == 'dot':
+                S1 = an.factor_sv(e[1])
+                S2 = an.factor_sv(e[2])
+                if S1 is not None and S2 is not None:
+                    n = an.sym[e[1]][0] if isinstance(e[1], str) \
+                        and e[1] in an.sym else None
+                    return _sdot(S1, S2, n)
+            if e[0] == 'idx':
+                S = an.factor_sv(e[1])
+                j = an.const_value(e[2])
+                if S is not None and j is not None:
+                    return _selem(S, int(j))
+        return None
+
+    def _dot_dpoly(self, args):
+        """Complete degree-2 expansion of a dot consumer:
+        Delta = delta*(<P1,S2> + <S1,P2>) + delta^2 * <P1,P2>.
+        Natural-value factors are only demanded for sides whose
+        partner actually moves (a derived binding's values may not
+        be known to the analyser, and are not needed then)."""
+        an = self.an
+        a, b_ = args
+        ma = an.mentions(a, self.name, tuple(self.derived_ast)) or \
+            (isinstance(a, str) and a in self.aux_pat)
+        mb = an.mentions(b_, self.name, tuple(self.derived_ast)) or \
+            (isinstance(b_, str) and b_ in self.aux_pat)
+        if not ma and not mb:
+            return []
+        P1 = self.pattern(a) if ma else ZERO_SV
+        P2 = self.pattern(b_) if mb else ZERO_SV
+        if P1 is DEPENDS or P2 is DEPENDS:
+            return DEPENDS
+        lin = Fraction(0)
+        if not is_zero_sv(P1):
+            S2 = an.factor_sv(b_)
+            if S2 is None:
+                return DEPENDS
+            lin += _sdot(P1, S2, self.n)
+        if not is_zero_sv(P2):
+            S1 = an.factor_sv(a)
+            if S1 is None:
+                return DEPENDS
+            lin += _sdot(S1, P2, self.n)
+        quad = _sdot(P1, P2, self.n)
+        return _dp([Fraction(0), lin, quad])
+
+    def _norm_marker(self, e):
+        an = self.an
+        if not an.mentions(e, self.name, tuple(self.derived_ast)) \
+                and not (isinstance(e, str) and e in self.aux_pat):
+            return []
+        S = an.factor_sv(e)
+        if S is None:
+            return DEPENDS
+        P = self.pattern(e)
+        if P is DEPENDS:
+            return DEPENDS
+        base2 = _sdot(S, S, self.n)
+        dpoly2 = _dp([Fraction(0),
+                      2 * _sdot(S, P, self.n),
+                      _sdot(P, P, self.n)])
+        return ('#norm', base2, dpoly2)
+
+    def scalar_gain(self, e):
+        """The linear (delta^1) coefficient, for the places that need
+        a plain gain (vector patterns, branch conditions)."""
+        p = self.scalar_dpoly(e)
+        if p is DEPENDS or isinstance(p, tuple):
+            return DEPENDS
+        return p[1] if len(p) > 1 else Fraction(0)
+
+    def dpoly_is_zero(self, e):
+        p = self.scalar_dpoly(e)
+        if p is DEPENDS:
+            return False
+        if isinstance(p, tuple):
+            return not p[2]
+        return not p
+
+    def _scalar_effect(self, a):
+        """Record the effect of printing scalar expression a."""
+        an = self.an
+        p = self.scalar_dpoly(a)
+        if isinstance(p, tuple):
+            self.effects.append(('norm', p[1], p[2]))
+            return
+        if p is DEPENDS:
+            # a top-level analytic consumer f(polynomial argument)
+            # is still decidable at a known delta
+            if isinstance(a, list) and a and a[0] in FN1:
+                sub = self.scalar_dpoly(a[1])
+                base = self.scalar_base(a[1])
+                if sub is not DEPENDS and not isinstance(sub, tuple) \
+                        and base is not None:
+                    if sub:
+                        self.effects.append(
+                            ('analytic', a[0], base, sub))
+                    else:
+                        self.effects.append(('scalar', []))
+                    return
+            self.effects.append(('depends', 'scalar consumer'))
+            return
+        self.effects.append(('scalar', p))
 
     # ------------------------------------------------ statement scan
     def scan_stmts(self, stmts):
@@ -386,10 +557,7 @@ class SiteScan:
                      an.shapes.get(a, ('scalar',))[0] == 'mat' else
                      'scalar')
                 if kind == 'scalar':
-                    g = self.scalar_gain(a)
-                    self.effects.append(
-                        ('depends', 'scalar consumer') if g is DEPENDS
-                        else ('scalar', g))
+                    self._scalar_effect(a)
                 elif kind == 'vec':
                     p = self.pattern(a)
                     self.effects.append(
@@ -413,7 +581,7 @@ class SiteScan:
             except Exception:
                 kind = 'scalar'
             if kind == 'scalar':
-                self.aux_scalar[name] = self.scalar_gain(val)
+                self.aux_scalar[name] = self.scalar_dpoly(val)
             elif kind == 'vec':
                 if an.mentions(val, self.name, tuple(self.derived_ast)) \
                         or (isinstance(val, str)
@@ -438,10 +606,12 @@ class SiteScan:
                 else:
                     self.interfering = True
                 return
-            g = self.scalar_gain(val)
-            if g is DEPENDS:
+            dp = self.scalar_dpoly(val)
+            if dp is DEPENDS or isinstance(dp, tuple) or len(dp) > 2:
                 self.effects.append(('depends', 'set-idx value'))
-            elif g != 0:
+                return
+            g = dp[1] if len(dp) > 1 else Fraction(0)
+            if g != 0:
                 base = self.aux_pat.get(target, ZERO_SV)
                 j = an.const_value(idx_e)
                 if j is None:
@@ -463,8 +633,7 @@ class SiteScan:
             self.scan_stmts(body)
             return
         if op == 'if':
-            g = self.scalar_gain(st[1])
-            if g is DEPENDS or g != 0:
+            if not self.dpoly_is_zero(st[1]):
                 self.effects.append(('depends', 'branch condition'))
             for branch in st[2:]:
                 if isinstance(branch, list) and branch:
@@ -608,34 +777,57 @@ def _site_report(self, name, idx_e, val, events, start):
     for tag, st in events[start:]:
         rest.append(st)
     scan.scan_stmts(rest)
-    effects = scan.effects
-    has_dep = any(e[0] == 'depends' for e in effects)
-    nonzero = []
-    for kind, payload in effects:
-        if kind == 'scalar' and payload != 0:
-            nonzero.append(('scalar', payload))
-        elif kind == 'vec' and not is_zero_sv(payload):
-            nonzero.append(('vec', payload))
-    if not nonzero and not has_dep:
-        rep.update(verdict='TRANSPARENT',
-                   reasons=['every downstream consumer has zero '
-                            'crosstalk gain at this slot'])
-        return rep
-    if delta is not None and nonzero:
-        deltas = [(kind, (g * delta if kind == 'scalar' else None))
-                  for kind, g in nonzero]
+    changed = []
+    unsure = [e[1] for e in scan.effects if e[0] == 'depends']
+    for e in scan.effects:
+        k = e[0]
+        if k == 'scalar':
+            if delta is not None:
+                dv = _dp_eval(e[1], delta)
+                if dv != 0:
+                    changed.append(('scalar', dv))
+            elif e[1]:
+                unsure.append('scalar consumer')
+        elif k == 'vec':
+            if not is_zero_sv(e[1]):
+                if delta is not None:
+                    changed.append(('vec', None))
+                else:
+                    unsure.append('printed vector')
+        elif k == 'norm':
+            base2, dp2 = e[1], e[2]
+            if delta is not None:
+                d2 = _dp_eval(dp2, delta)
+                if d2 != 0:
+                    changed.append(('norm2', d2))
+                    rep['delta_norm'] = math.sqrt(float(base2 + d2)) \
+                        - math.sqrt(float(base2))
+            elif dp2:
+                unsure.append('norm consumer')
+        elif k == 'analytic':
+            _, fn, base, dp = e
+            if delta is not None:
+                da = _dp_eval(dp, delta)
+                if da != 0:
+                    f = abs if fn == 'abs' else getattr(math, fn)
+                    changed.append(
+                        ('analytic',
+                         f(float(base + da)) - f(float(base))))
+            elif dp:
+                unsure.append('analytic consumer')
+    if scan.interfering and any(e[0] == 'depends' for e in scan.effects):
+        unsure.append('interfering write plus unmodelled consumer')
+    if changed:
         rep.update(verdict='DESTRUCTIVE',
-                   reasons=['a downstream consumer has nonzero '
-                            'crosstalk gain at this slot'],
-                   predicted=deltas)
+                   reasons=['a downstream consumer provably changes'],
+                   predicted=changed)
         return rep
-    if scan.interfering and has_dep:
-        rep.update(verdict='UNKNOWN',
-                   reasons=['interfering write plus unmodelled '
-                            'consumer'])
+    if unsure:
+        rep.update(verdict='UNKNOWN', reasons=unsure)
         return rep
-    rep.update(verdict='UNKNOWN',
-               reasons=['unmodelled consumer or unknown written value'])
+    rep.update(verdict='TRANSPARENT',
+               reasons=['every downstream consumer is provably '
+                        'unchanged (delta-polynomials all vanish)'])
     return rep
 
 

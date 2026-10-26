@@ -103,7 +103,48 @@ check_case('feedback write (value from another slot)',
            'DESTRUCTIVE', Fraction(2))
 check_case('norm consumer abstains',
            f'(program {V} (set-idx v 2.0 99.0) (print (norm v)))',
-           'UNKNOWN')
+           'DESTRUCTIVE')
+
+# --- v0.14: delta-polynomial consumers and exact norm -------------
+# norm: Delta(||v||^2) = 2*delta*v[2] + delta^2 = 2*97*2 + 97^2
+_stmts = parse(f'(program {V} (set-idx v 2.0 99.0) (print (norm v)))')
+_s = predict_program(_stmts)
+_d2 = [d for k, d in _s[0].get('predicted', []) if k == 'norm2']
+expect(_s[0]['verdict'] == 'DESTRUCTIVE' and _d2 == [Fraction(9797)],
+       f'norm: exact Delta(||v||^2) = {_d2} (want [9797])')
+# a sign flip of one element provably preserves the norm:
+# delta = -4 at slot 2 (value 2 -> -2): 2*(-4)*2 + 16 = 0
+check_case('norm sign-flip is transparent',
+           f'(program {V} (set-idx v 2.0 -2.0) (print (norm v)))',
+           'TRANSPARENT')
+# (dot v w)^2: the delta^2 cross term is now exact.
+# natural dot = 10, gain = 1 -> Delta = (10+97)^2 - 10^2 = 11349
+_stmts = parse(f'(program {V} {W1} (set-idx v 2.0 99.0)'
+               ' (print (* (dot v w) (dot v w))))')
+_s = predict_program(_stmts)
+_ds = [d for k, d in _s[0].get('predicted', []) if k == 'scalar']
+expect(_s[0]['verdict'] == 'DESTRUCTIVE' and _ds == [Fraction(11349)],
+       f'(dot)^2 consumer: exact Delta = {_ds} (want [11349])')
+# dot with itself: Delta(||v||^2) through the dot path
+_stmts = parse(f'(program {V} (set-idx v 2.0 99.0) (print (dot v v)))')
+_s = predict_program(_stmts)
+_ds = [d for k, d in _s[0].get('predicted', []) if k == 'scalar']
+expect(_s[0]['verdict'] == 'DESTRUCTIVE' and _ds == [Fraction(9797)],
+       f'dot(v,v): exact Delta = {_ds} (want [9797])')
+# analytic consumers at a known delta: sqrt(||v||^2) and exp(idx)
+_stmts = parse(f'(program {V} (set-idx v 2.0 99.0)'
+               ' (print (sqrt (dot v v))))')
+_s = predict_program(_stmts)
+_da = [d for k, d in _s[0].get('predicted', []) if k == 'analytic']
+import math as _math
+_want = _math.sqrt(9827.0) - _math.sqrt(30.0)
+expect(_s[0]['verdict'] == 'DESTRUCTIVE' and len(_da) == 1
+       and abs(_da[0] - _want) < 1e-9,
+       f'sqrt(dot(v,v)): analytic Delta = {_da} (want {_want:.6f})')
+check_case('exp(idx) analytic consumer',
+           f'(program {V} (set-idx v 2.0 99.0)'
+           ' (print (exp (idx v 2.0))))',
+           'DESTRUCTIVE')
 # overwrite before any use: two sites; the first is transparent
 # because the second write restores the natural value before the
 # only consumer runs.
@@ -153,6 +194,9 @@ for trial in range(150):
         ['print', 'v'],
         ['print', 1.0],
         ['block', ['let', 's', ['dot', 'v', 'w']], ['print', 's']],
+        ['print', ['norm', 'v']],
+        ['print', ['*', ['dot', 'v', 'w'], ['dot', 'v', 'w']]],
+        ['print', ['sqrt', ['dot', 'v', 'v']]],
     ])
     ast = ['program', ['let', 'v', base], ['let', 'w', ['vec'] + w],
            ['set-idx', 'v', float(i), written], consumer]
