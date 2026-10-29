@@ -425,6 +425,105 @@ norm の Δ(‖v‖²)=9797 の厳密予測、符号反転の透過、(dot)² �
 Δ=11349、sqrt/exp の解析的 Δ を追加。ランダムバッテリーは消費者に
 norm・(dot)²・sqrt を加えても150件で矛盾なし。
 
+## v0.15 TexNP — 依存関係を超越した NumPy ライブラリ、テクセクタム版（2026-10-29）
+
+NumPy 相当のコアを linkc の演算子として実装した（`examples/texnp.link`、
+検証は `test_texnp.py`）。生成バイナリの実行時依存は OS の標準ライブラリ
+（libc / libgcc）のみで、**Python・NumPy・BLAS/LAPACK・外部クレートは
+一切使わない**。線形代数も LAPACK に頼らず、部分ピボット付きガウス消去を
+Rust 標準ライブラリだけで自前実装した。つまり依存は「コンパイル時の
+rustc 1 回」までで、成果物は単独で動く。
+
+追加した演算子（NumPy 対応）：
+
+| 分類 | .link | NumPy |
+|---|---|---|
+| 生成 | `arange` `linspace` `full` `full2` `zeros2` `ones2` `eye` `mat` `diag` | arange / linspace / full / zeros / ones / eye / array / diag |
+| 集約 | `sum` `prod` `mean` `var` `std` `median` `vmin` `vmax` `argmin` `argmax`（sum/mean は Mat 全体にも） | sum / prod / mean / var(ddof=0) / std / median / min / max / argmin / argmax |
+| 操作 | `cumprod` `concat` `reverse` `sort` `argsort` `slice` `reshape` `flatten` `diag-of` `rows` `cols` `clip` `maximum` `minimum` `pow` | cumprod / concatenate / sort / argsort / reshape / ravel / diag / shape / clip / maximum / minimum / power |
+| 線形代数 | `det` `solve` `inv` `rank` `trace` `matpow`（既存の dot/norm/outer/gram/matvec/matmul/transpose と併用） | det / solve / inv / matrix_rank / trace / matrix_power |
+| 要素関数 | `log2` `log10` `tan` `asin` `acos` `atan` `sinh` `cosh` `tanh` `floor` `ceil` `round` `trunc` を追加（既存の sqrt/exp/log/abs/sin/cos と同じ要素別適用） | 同名関数群 |
+
+検証（2026-10-29、このVMで実測）：`test_texnp.py` 全合格 ――
+texnp.link の全出力行が NumPy 1.26.4（テスト用オラクルのみ、生成物は
+不使用）と一致、ランダム fuzz 30件（ベクトル・行列・逆行列・ランク・
+行列積）も NumPy と一致（許容 1e-7）。`ldd out/texnp` は
+linux-vdso / libgcc_s / libc / ld-linux のみで、python・numpy・blas・
+lapack の不在を機械的に確認した。既存 demo.link の出力も不変。
+
+速度の目安（この環境での実測、一般的な主張ではない）：10⁶要素の
+√和・平均・分散＋200×200 行列積を TexNP バイナリ 0.075s、
+同等処理の NumPy スクリプト（起動込み）0.120s で、全値一致
+（和と分散は総和の順序差による相対 1e-13 級の差のみ）。
+
+### ベンチマーク（bench_texnp.py、2026-10-29、この2コアVMで実測）
+
+TexNP はバイナリのプロセス総時間（起動込み、中央値）、NumPy は
+プロセス内計算時間のみ（起動 0.152s は含まない）という、NumPy に
+有利な条件で計測し、全項目で出力の一致を確認してから時間を採った。
+
+| 項目 | TexNP(s) | NumPy(s) | 比 (NumPy/TexNP) |
+|---|---|---|---|
+| sqrt+sum 10⁶ | 0.0121 | 0.0046 | 0.38x |
+| dot 10⁶ | 0.0067 | 0.0016 | 0.24x |
+| cumsum+sum 10⁶ | 0.0160 | 0.0091 | 0.57x |
+| mean/var/std 10⁶ | 0.0106 | 0.0052 | 0.49x |
+| sort 10⁶（疑似ランダム） | 0.0826 | 0.0367 | 0.44x |
+| argsort 10⁶ | 0.1000 | 0.0470 | 0.47x |
+| matmul 200×200 | 0.0092 | 0.0147 | **1.60x** |
+| matmul 500×500 | 0.1318 | 0.1778 | **1.35x** |
+| inv 300×300 | 0.0216 | 0.0246 | **1.14x** |
+| det 300×300 | 0.0151 | 0.0071 | 0.47x |
+| solve 300×300 | 0.0343 | 0.0081 | 0.23x |
+| matvec 500×500 | 0.0078 | 0.0007 | 0.09x |
+
+読み方：要素演算・集約・ソートでは NumPy の最適化済みカーネルが
+2〜4倍速い（想定通り）。一方この環境の NumPy はディストリビューション
+同梱の system BLAS で行列積が遅く、素朴な自前 matmul が 1.3〜1.6倍
+勝った。これは「TexNP が BLAS より速い」ではなく「この BLAS が素朴
+実装並みに遅い」という環境依存の結果で、調整済み OpenBLAS＋多スレッド
+の環境では逆転しうる。プロセス総時間で比べれば NumPy 側に起動 0.152s が
+乗り、短い処理では全項目 TexNP が勝つ。
+
+既知の制限：軸指定の集約（axis=）なし、ブロードキャストは従来通り
+スカラー相手のみ、複素数なし、`solve`/`inv`/`det` は正方行列のみ、
+SVD/eigh は未実装（次の段階の候補 1 のまま）。
+
+### rankop 高速化（v0.15.1、2026-10-29）
+
+linkir の symmat（v0.11）で解釈実行側だけが持っていた rankop の
+因子保持を、linkc のコード生成にも入れた。`coef・a bᵀ` の形をした
+行列（`outer`、その転置・スカラー倍、`matmul` の合成）は因子のまま
+追跡され、消費者は因子の上で答える。
+
+- `matvec`：`a・(coef・(bᵀx))` で O(n)
+- `matmul`：両辺が因子形なら `(bᵀc)` 1個で繋ぎ直し、片側だけなら
+  O(n²)（密な O(n³) を回避）
+- `trace` ＝ `coef・(aᵀb)`、`sum`/`mean` ＝ 因子の和の積、`det` は
+  n>1 で厳密に 0（O(1)）
+- **遅延束縛**：両因子が素の変数のとき、`let` は行列を実体化せず
+  因子だけを束縛する（係数は隠しスカラー変数へ）。密な消費者が
+  来たときだけ実体化し、`set`/`set-idx` の前には実体化してから
+  因子記録を破棄する（書き込みで因子が腐らないため）
+
+検証：`test_rankop_opt.py` 全合格（n=1,2,5,17 で因子形＝密経路
+（`+ zeros2` で強制）＝NumPy、混合の因子×密、20000×20000 の
+ランク1行列を実体化なしで回答）。`test_texnp.py`・demo.link の回帰なし。
+
+実測（`bench_rankop.py`、この VM、全て出力一致を確認して計測）：
+
+| 問い | TexNP 因子形 | TexNP 密 | NumPy 密 |
+|---|---|---|---|
+| matvec n=5000 | 0.0021s | 0.7022s（337倍） | 0.1798s（86倍） |
+| trace+sum n=5000 | 0.0042s | 0.6585s（156倍） | 0.1621s（38倍） |
+| det n=800 | 0.0034s | 0.0276s（8.1倍） | 0.2010s（59倍） |
+| (A@A) の trace+sum n=700 | 0.0013s | 0.5599s（416倍） | 0.7374s（548倍） |
+
+スケーリング：trace・matvec・det の3問を n=100000（密行列なら
+80GB）でも 0.0093s で回答。NumPy でも構造を知る人間がベクトルで
+書き直せば同速になる――この高速化の実体は、その書き直しを
+コンパイラが自動でやることにある。構造のない密行列には効かない。
+
 ## 次の段階の候補
 
 1. SVD/eigh をLink演算として追加し、PCA持ち上げ実験を `.link` で書き直す

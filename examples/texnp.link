@@ -1,0 +1,36 @@
+; texnp.link -- TexNP: NumPy-equivalent core in Texectum (.link)
+; The compiled binary uses only the Rust standard library:
+; no Python, no NumPy, no BLAS/LAPACK, no external crates.
+(program
+  (let a (arange 1.0 6.0))                    ; [1 2 3 4 5]
+  (print "a =" a)
+  (print "sum =" (sum a) "mean =" (mean a) "prod =" (prod a))
+  (print "var =" (var a) "std =" (std a) "median =" (median a))
+  (print "vmin =" (vmin a) "vmax =" (vmax a) "argmin =" (argmin a) "argmax =" (argmax a))
+  (print "cumprod =" (cumprod a))
+  (print "pow2 =" (pow a 2.0) "sum_pow2 =" (sum (pow a 2.0)))
+  (print "linspace =" (linspace 0.0 1.0 5.0))
+  (print "log2 =" (log2 (vec 1.0 2.0 4.0 8.0)))
+
+  (let b (vec 5.0 1.0 4.0 2.0 3.0))
+  (print "sort =" (sort b) "argsort =" (argsort b) "reverse =" (reverse (sort b)))
+  (print "slice =" (slice a 1.0 4.0) "concat =" (concat (slice a 0.0 2.0) (slice a 3.0 5.0)))
+  (print "clip =" (clip (vec -1.0 0.5 2.0 10.0) 0.0 3.0))
+  (print "maximum =" (maximum a (vec 3.0 3.0 3.0 3.0 3.0)))
+  (print "full =" (full 3.0 7.0))
+
+  (let M (mat (vec 1.0 2.0) (vec 3.0 4.0)))
+  (print "M =" M)
+  (print "det =" (det M) "trace =" (trace M) "rank =" (rank M))
+  (print "inv =" (inv M))
+  (print "solve =" (solve M (vec 5.0 11.0)))          ; [1 2]
+  (print "matpow2 =" (matpow M 2.0))                  ; [[7 10][15 22]]
+  (print "flatten =" (flatten M) "sumM =" (sum M) "meanM =" (mean M))
+  (print "diag-of =" (diag-of M) "rows =" (rows M) "cols =" (cols M))
+  (print "reshape =" (reshape (arange 6.0) 2.0 3.0))
+  (print "eye =" (eye 3.0))
+  (print "diag =" (diag (vec 1.0 2.0 3.0)))
+  (print "rank1 =" (rank (mat (vec 1.0 2.0) (vec 2.0 4.0))))
+  (print "zeros2 =" (zeros2 2.0 3.0))
+  (print "ones2 =" (ones2 1.0 3.0))
+  (print "full2 =" (full2 2.0 2.0 9.0)))
