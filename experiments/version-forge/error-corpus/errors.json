@@ -1,0 +1,114 @@
+[
+ {
+  "script": "err01_zero_div.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "ZeroDivisionError",
+  "message": "integer division or modulo by zero",
+  "stdout_last": ""
+ },
+ {
+  "script": "err02_import_missing.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "ModuleNotFoundError",
+  "message": "No module named 'numpy_next_generation'",
+  "stdout_last": ""
+ },
+ {
+  "script": "err03_version_gate.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "ImportError",
+  "message": "this library requires numpy>=2.0, got 1.26.4",
+  "stdout_last": ""
+ },
+ {
+  "script": "err04_dtype_size.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "ValueError",
+  "message": "numpy.dtype size changed, may indicate binary incompatibility. Expected 96 from C header, got 88 from PyObject",
+  "stdout_last": ""
+ },
+ {
+  "script": "err05_segfault.py",
+  "returncode": -11,
+  "signal": 11,
+  "exception": null,
+  "message": "",
+  "stdout_last": ""
+ },
+ {
+  "script": "err06_type_error.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "TypeError",
+  "message": "can only concatenate str (not \"int\") to str",
+  "stdout_last": ""
+ },
+ {
+  "script": "err07_broadcast.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "ValueError",
+  "message": "operands could not be broadcast together with shapes (3,4) (4,3)",
+  "stdout_last": ""
+ },
+ {
+  "script": "err08_recursion.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "RecursionError",
+  "message": "maximum recursion depth exceeded",
+  "stdout_last": ""
+ },
+ {
+  "script": "err09_memory.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "numpy.core._exceptions._ArrayMemoryError",
+  "message": "Unable to allocate 7.28 TiB for an array with shape (1000000000000,) and data type float64",
+  "stdout_last": ""
+ },
+ {
+  "script": "err10_assert.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "AssertionError",
+  "message": "format mismatch: offset 40 != expected 32",
+  "stdout_last": ""
+ },
+ {
+  "script": "err11_file_not_found.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "FileNotFoundError",
+  "message": "[Errno 2] No such file or directory: '/nonexistent/layout.bin'",
+  "stdout_last": ""
+ },
+ {
+  "script": "err12_exit_code.py",
+  "returncode": 3,
+  "signal": null,
+  "exception": null,
+  "message": "doing fine until...",
+  "stdout_last": "doing fine until..."
+ },
+ {
+  "script": "err13_syntax.py",
+  "returncode": 1,
+  "signal": null,
+  "exception": "SyntaxError",
+  "message": "invalid syntax",
+  "stdout_last": ""
+ },
+ {
+  "script": "ok00_control.py",
+  "returncode": 0,
+  "signal": null,
+  "exception": null,
+  "message": "control OK 6.0",
+  "stdout_last": "control OK 6.0"
+ }
+]
